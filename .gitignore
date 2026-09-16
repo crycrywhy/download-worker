@@ -1,0 +1,20 @@
+# runtime artifacts (created by an installation, never part of the package)
+logs/
+*.log
+*.log.sync-state
+bandwidth.json
+worker-config.json
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# build products
+*.zip
+
+# editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
