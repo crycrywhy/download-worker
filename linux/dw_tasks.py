@@ -18,22 +18,27 @@
    ⚠ 下载器一开始就把目标文件 sparse 预分配到全尺寸，所以 `ls -l` 的大小**不代表进度**，
    唯一可靠的两个来源就是 sidecar 与已分配块数。
 
-3. **别的 driver 的台账 CSV**（`EXTRA_LEDGERS`，见下）—— 2026-09-18 用户定：「alt 的下载统一用
-   ds 同款 driver，用户在一个监控面看全部下载」。所以 alt 那条核基因组线的 state 台账也并进同一帧，
-   归属标签挂在物种名前面（`alt·Genus species`），Windows 侧渲染不用改。
+3. **别的 driver 的台账 CSV**（`EXTRA_LEDGERS`，见下）—— 几路 driver 各写各的台账时，
+   想在**一个监控面**里看全部下载：把它们的 state 台账并进同一帧，归属标签挂在物种名前面
+   （`<owner>·<species>`），Windows 侧渲染不用改。
 
    | 归属 | 台账 | 列 |
    |---|---|---|
-   | alt | `~/.config/download-worker/extra_ledgers/dl_status_*.csv` | `genbank,state,out,size,md5,ts` |
+   | `<owner>` | 配置文件里给的 glob | `genbank,state,out,size,md5,ts` |
 
    列名口径与主台账不同，`normalize_extra()` 归一化：物种名从 `out` 路径反推
    （`<...>/genome/<Genus>/<Genus_species_taxid>/<file>`），状态映射
    `downloading->DOWNLOADING / downloaded->DONE / failed->FAILED`。
    这类行的 `ts` 也当一路活性信号用（见 `is_live`）。
 
-   **时间口径统一成 UTC+8**：主台账是 `status_collector.py` 用 TZ8 写的（+8），`外部 driver`
-   的 state 台账写的是 UTC —— 每份台账在 `EXTRA_LEDGERS` / `MAIN_TZ_H` 里声明自己的偏移，
-   换算成 epoch 后**排序用 epoch、显示用 UTC+8**，两份混排才是实际时间顺序。
+   **时间口径统一成 UTC+8**：主台账按 +8 写、别的台账可能按 UTC 写 —— 每份台账在
+   配置文件 / `MAIN_TZ_H` 里声明自己的偏移，换算成 epoch 后
+   **排序用 epoch、显示用 UTC+8**，多份混排才是实际时间顺序。
+
+**本机的具体路径都不写在这个文件里**（它是公开的），一律放配置文件
+（`~/.config/download-worker/dw_tasks.json`，可用环境变量 `DW_TASKS_CONFIG` 换位置）：
+`status_csv_candidates`（主台账候选路径）、`extra_ledgers`（别的 driver 的台账）、`main_tz_h`。
+文件不存在就用中性默认，功能照常、只是少几路台账。
 
 用法
 ----
@@ -58,11 +63,37 @@ from datetime import datetime, timedelta, timezone
 
 SCHEMA = 1
 
-# 台账 CSV 的常见位置（按顺序取第一个存在的）。也可以用环境变量 DW_STATUS_CSV 指定。
-CSV_CANDIDATES = [
-    "~/.config/download-worker/download_status.csv",
-    "~/.config/download-worker/state/download_status.csv",
-    "~/.config/download-worker/daily/download_status.csv",
+# 本机的具体路径走配置文件，**不写死在这个（公开的）文件里**。
+# 位置：`~/.config/download-worker/dw_tasks.json`，可用 DW_TASKS_CONFIG 覆盖。
+# 认得的键（都可以缺，缺了就用中性默认）：
+#   status_csv_candidates : [路径, ...]     主台账 CSV 候选（按顺序取第一个存在的）
+#   main_tz_h             : 8               主台账时间列的时区偏移（相对 UTC）
+#   extra_ledgers         : [{glob, owner, kind, tz_h}, ...]   别的 driver 的台账
+DEFAULT_CONFIG_PATH = "~/.config/download-worker/dw_tasks.json"
+
+
+def load_config(path=None):
+    """读配置文件；没有 / 读不动就返回中性默认（功能照常，只是少几路台账）。"""
+    cfg = {"status_csv_candidates": None, "main_tz_h": None, "extra_ledgers": None}
+    path = path or os.environ.get("DW_TASKS_CONFIG") or DEFAULT_CONFIG_PATH
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return cfg
+    if isinstance(raw, dict):
+        for key in cfg:
+            if key in raw:
+                cfg[key] = raw[key]
+    return cfg
+
+
+CONFIG = load_config()
+
+# 台账 CSV 的常见位置（按顺序取第一个存在的）。也可以用环境变量 DW_STATUS_CSV 指定，
+# 或在配置文件里用 status_csv_candidates 覆盖。
+CSV_CANDIDATES = CONFIG["status_csv_candidates"] or [
+    DEFAULT_CONFIG_PATH.rsplit("/", 1)[0] + "/download_status.csv",
 ]
 
 # 哪些状态算「正在派送」（要显示进度），哪些算「最近完成」
@@ -85,23 +116,26 @@ COLUMN_ALIASES = {
 }
 
 # 别人的 driver 台账： (glob, 归属, 列口径, 该台账时间列的时区偏移[小时, 相对 UTC])。
-# 用户定的「一个监控面看全部下载」，所以这些行并进同一帧的 active / recent / counts，
-# 只多了个归属前缀。要加新线就在这里加一行。
+# 「一个监控面看全部下载」：这些行并进同一帧的 active / recent / counts，只多了个归属前缀。
+# 条目来自配置文件的 extra_ledgers（公开代码里默认为空）；kind 目前只认 "extra"。
 #
-# ⚠ 时间口径必须声明对，两份台账默认写得不一样：主台账由 status_collector.py 用 TZ8 写（+8），
-# 外部 driver 写的 state 台账是 datetime.now()（UTC）。混排时不声明就会排错序
-# （实测：18:41(+8) = 10:41Z 被排到 15:58Z 前面，看着像时间倒流）。
-EXTRA_LEDGERS = [
-    ("~/.config/download-worker/extra_ledgers/dl_status_*.csv", "alt", "extra", 0),
-]
+# ⚠ 时间口径必须声明对：几路台账默认写得不一样（一路按 +8 写、另一路按 UTC 写是常事）。
+# 混排时不声明就会排错序（实测：18:41(+8) = 10:41Z 被排到 15:58Z 前面，看着像时间倒流）。
+EXTRA_LEDGERS = []
+for _spec in (CONFIG["extra_ledgers"] or []):
+    if isinstance(_spec, dict) and _spec.get("glob"):
+        EXTRA_LEDGERS.append((_spec["glob"], _spec.get("owner") or "other",
+                              _spec.get("kind") or "extra", _spec.get("tz_h", 0.0)))
+    elif isinstance(_spec, (list, tuple)) and _spec:      # 也认 [glob, owner, kind, tz_h]
+        EXTRA_LEDGERS.append(tuple(_spec))
 
-# 主台账（download_status.csv）时间列的时区偏移，来源 status_collector.py 的 TZ8
-MAIN_TZ_H = 8
+# 主台账时间列的时区偏移（配置文件可覆盖）
+MAIN_TZ_H = 8 if CONFIG["main_tz_h"] is None else CONFIG["main_tz_h"]
 
 # 显示口径：一律 UTC+8（和主台账、和给用户的所有报告一致）
 DISPLAY_TZ = timezone(timedelta(hours=8))
 
-# 外部 driver 台账的 state 取值 -> 本脚本的状态口径
+# 别的 driver 台账里的 state 取值 -> 本脚本的状态口径
 EXTRA_STATES = {
     "downloading": "DOWNLOADING",
     "downloaded": "DONE",
@@ -219,7 +253,7 @@ def species_from_out(out):
 
 
 def normalize_extra(row, owner, source_tz=0.0):
-    """外部 driver 台账的一行 -> 主台账那套列名，让下面的循环认不出来差别。
+    """别的 driver 台账的一行 -> 主台账那套列名，让下面的循环认不出来差别。
 
     时间统一换算成显示口径（UTC+8）：源台账写的是 UTC，转过来「最近完成」才排得对、标得一致。
     """
@@ -383,7 +417,7 @@ def snapshot(csv_path, limit, previous, previous_at):
     """读一次台账 + 扫一次在下任务，拼出这一帧。previous = 上一次的 {key: bytes_done}。
 
     主台账 + 所有 EXTRA_LEDGERS（别的 driver 的线）合成一个列表处理：计数、在下、最近完成
-    都是「全部下载」的口径，归属只体现在物种名的 `alt·` 前缀与 `owner` 字段上。
+    都是「全部下载」的口径，归属只体现在物种名的 `<owner>·` 前缀与 `owner` 字段上。
     """
     rows = load_rows(csv_path)
     extra, ledgers = extra_rows()
@@ -434,7 +468,7 @@ def snapshot(csv_path, limit, previous, previous_at):
     # 再次按进度、物种名。三路都没动过的排最后 —— 它们是待重排队的残留。
     active.sort(key=lambda e: (not e.get("live"), activity_age(e), -(e.get("percent") or -1),
                                e.get("species", "")))
-    # 最近完成：按 epoch 倒序。**不能比字符串** —— 主台账写 CST(+8)、alt 台账写 UTC，
+    # 最近完成：按 epoch 倒序。**不能比字符串** —— 一路台账写 +8、另一路写 UTC，
     # 混排时 18:41(CST)=10:41Z 会排到 15:58Z 前面，看着像时间倒流。
     recent.sort(key=lambda e: e.get("updated_epoch") or 0, reverse=True)
     recent = recent[:limit]

@@ -74,7 +74,7 @@ python3 mcp_server.py        # 直接手跑即为 stdio server（日志走 stder
 | `WINDL_DOWNLOADER` | `<项目>/vendor/linux_downloader.py` | 既有下载器脚本路径。**接入生产时应指向真实脚本**（`vendor/` 那份是随仓库固定的版本副本，供离线测试用） |
 | `WINDL_PYTHON` | 本进程解释器 | 运行下载器与辅助脚本的解释器 |
 | `WINDL_WORKER_URL` | `http://127.0.0.1:8766` | 单端点模式用的出口端点（没配池时用它） |
-| `WINDL_SCRIPTS_DIR` | downloader 所在目录 | 存放 `worker_pool.py` / `worker_alert.py` / `status_collector.py` 的目录 |
+| `WINDL_SCRIPTS_DIR` | downloader 所在目录 | 存放 `worker_pool.py` / `worker_alert.py` 等 的目录 |
 | `WINDL_REGISTRY` | `<scripts_dir>/workers.json` | 出口端口注册表（池的成员名单） |
 | `WINDL_WORKER_STATUS` | `<scripts_dir>/worker_status.json` | 探活哨兵写的状态快照（含 `down_since`、上线记录） |
 | `WINDL_STATE_DIR` | `<scripts_dir>/state` | 完整性/修复状态目录（修复 manifest 等） |

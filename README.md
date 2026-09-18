@@ -418,7 +418,7 @@ download-worker process -ProcessInterval 5   # 换成 5 秒一帧
 
 | 来源 | 提供什么 |
 |---|---|
-| 下载台账 CSV（默认自动探测 `~/.config/download-worker/download_status.csv` 等位置，也可 `--status-csv` / 环境变量 `DW_STATUS_CSV` 指定） | 各状态计数、当前在下（`DOWNLOADING` / `REPAIRING`）、最近完成 |
+| 下载台账 CSV（`--status-csv` / 环境变量 `DW_STATUS_CSV` 指定，或配置文件里的 `status_csv_candidates` 按顺序自动探测） | 各状态计数、当前在下（`DOWNLOADING` / `REPAIRING`）、最近完成 |
 | 在下任务目录里的断点文件 `<输出文件>.download.json` | 精确进度（已完成块 → 字节 → 百分比）、块计数、断点文件新鲜度 |
 
 > 下载器一开始就把目标文件 **sparse 预分配到全尺寸**，所以 `ls -l` 的大小**不代表进度**；唯一可靠的两个来源就是断点文件与已分配块数（后者作为退路）。
