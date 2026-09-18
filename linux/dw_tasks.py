@@ -356,4 +356,12 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except BrokenPipeError:                 # Windows 侧关了管道（Ctrl+C / ssh 断开）
+        # 光 exit 不够：解释器退出时会**再 flush 一次** stdout，那时管道已经没了，
+        # 于是远端 stderr 多出一行 "Exception ignored in: ... BrokenPipeError"，
+        # 而 process 面板把非 JSON 行原样打出来 —— 用户按 Ctrl+C 就会看到这行噪声。
+        # 把 stdout 指到 /dev/null 再退，flush 就落在空设备上。
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
         sys.exit(0)
