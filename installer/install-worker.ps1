@@ -1826,7 +1826,7 @@ function Start-AndVerifyTunnel {
         Write-Log "tunnel_supervisor.py is not running - a dropped tunnel would NOT come back" "WARN"
     }
     else {
-        Write-Log "tunnel supervisor is running (restarts the ssh on exit, 5/10/30/60s backoff)" "OK"
+        Write-Log "tunnel supervisor is running (restarts the ssh on exit, 5/10/15/20/30s backoff)" "OK"
     }
 
     $ssh = @(Get-TunnelSshProcesses -TunnelPorts @($LinuxTunnelPort))
@@ -1846,7 +1846,7 @@ function Start-AndVerifyTunnel {
     }
 
     if (@($split.Foreign).Count -gt 0) {
-        # The supervisor retries on its own schedule (5/10/30/60 s backoff): give it the
+        # The supervisor retries on its own schedule (5/10/15/20/30 s backoff): give it the
         # chance to grab the port instead of failing the install on the spot.
         Write-Log "  stale tunnel removed - waiting for the supervisor to take the port (up to 90 s)" "WARN"
         $deadline = (Get-Date).AddSeconds(90)
