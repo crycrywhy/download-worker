@@ -29,7 +29,11 @@
    列名口径与主台账不同，`normalize_extra()` 归一化：物种名从 `out` 路径反推
    （`<...>/genome/<Genus>/<Genus_species_taxid>/<file>`），状态映射
    `downloading->DOWNLOADING / downloaded->DONE / failed->FAILED`。
-   这类行的 `ts` 是分钟精度的本地时间，也当一路活性信号用（见 `is_live`）。
+   这类行的 `ts` 也当一路活性信号用（见 `is_live`）。
+
+   **时间口径统一成 UTC+8**：主台账是 `status_collector.py` 用 TZ8 写的（+8），`外部 driver`
+   的 state 台账写的是 UTC —— 每份台账在 `EXTRA_LEDGERS` / `MAIN_TZ_H` 里声明自己的偏移，
+   换算成 epoch 后**排序用 epoch、显示用 UTC+8**，两份混排才是实际时间顺序。
 
 用法
 ----
@@ -50,7 +54,7 @@ import os
 import socket
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 SCHEMA = 1
 
@@ -80,11 +84,22 @@ COLUMN_ALIASES = {
     "notes": ("notes", "note", "remark", "备注"),
 }
 
-# 别人的 driver 台账： (glob, 归属, 列口径)。用户定的「一个监控面看全部下载」，所以这些
-# 行并进同一帧的 active / recent / counts，只多了个归属前缀。要加新线就在这里加一行。
+# 别人的 driver 台账： (glob, 归属, 列口径, 该台账时间列的时区偏移[小时, 相对 UTC])。
+# 用户定的「一个监控面看全部下载」，所以这些行并进同一帧的 active / recent / counts，
+# 只多了个归属前缀。要加新线就在这里加一行。
+#
+# ⚠ 时间口径必须声明对，两份台账默认写得不一样：主台账由 status_collector.py 用 TZ8 写（+8），
+# 外部 driver 写的 state 台账是 datetime.now()（UTC）。混排时不声明就会排错序
+# （实测：18:41(+8) = 10:41Z 被排到 15:58Z 前面，看着像时间倒流）。
 EXTRA_LEDGERS = [
-    ("~/.config/download-worker/extra_ledgers/dl_status_*.csv", "alt", "extra"),
+    ("~/.config/download-worker/extra_ledgers/dl_status_*.csv", "alt", "extra", 0),
 ]
+
+# 主台账（download_status.csv）时间列的时区偏移，来源 status_collector.py 的 TZ8
+MAIN_TZ_H = 8
+
+# 显示口径：一律 UTC+8（和主台账、和给用户的所有报告一致）
+DISPLAY_TZ = timezone(timedelta(hours=8))
 
 # 外部 driver 台账的 state 取值 -> 本脚本的状态口径
 EXTRA_STATES = {
@@ -126,20 +141,26 @@ def find_csv(explicit):
     return "", checked
 
 
-def text_age(text):
-    """台账里的时间文本 -> 年龄（秒）；认不出来返回 None。
+def text_epoch(text, tz_h=0.0):
+    """台账里的时间文本 -> epoch 秒；认不出来返回 None。
 
-    用 timegm 而不是 mktime：这些台账写的是 UTC（服务器时区就是 UTC），不受进程 TZ 影响。
+    tz_h = **该台账时间列的时区偏移**（相对 UTC 的小时数）。先用 timegm 按 UTC 解析再减偏移，
+    所以与进程 TZ 无关；两份台账口径不同也各自算得对（见 EXTRA_LEDGERS 的说明）。
     """
     text = (text or "").strip()
     if not text:
         return None
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
-            return max(0.0, time.time() - calendar.timegm(time.strptime(text, fmt)))
+            return calendar.timegm(time.strptime(text, fmt)) - tz_h * 3600.0
         except ValueError:
             continue
     return None
+
+
+def cst_text(epoch):
+    """epoch -> UTC+8 的 'YYYY-MM-DD HH:MM'（显示口径，和主台账一致）。"""
+    return datetime.fromtimestamp(epoch, DISPLAY_TZ).strftime("%Y-%m-%d %H:%M")
 
 
 def newest_file_age(directory):
@@ -165,17 +186,20 @@ def newest_file_age(directory):
     return None if newest is None else max(0.0, time.time() - newest)
 
 
+def activity_age(entry):
+    """这条最近一次「动过」是多久以前（秒）；三路都没有就给一个很大的数（排最后）。"""
+    ages = [entry.get(k) for k in ("sidecar_age_s", "mtime_age_s", "updated_age_s")]
+    ages = [age for age in ages if age is not None]
+    return min(ages) if ages else 10 ** 9
+
+
 def is_live(entry):
-    """三路取最新：sidecar 新鲜度 / 目标文件 mtime / 台账 ts（分钟精度）。
+    """三路取最新：sidecar 新鲜度 / 目标文件 mtime / 台账 ts。
 
     任一路落在 LIVE_WINDOW_S 内就算「此刻真在传输」。台账里挂着 DOWNLOADING 但三路都停了的，
     是中断残留 —— 两者必须分开显示。
     """
-    for key in ("sidecar_age_s", "mtime_age_s", "updated_age_s"):
-        age = entry.get(key)
-        if age is not None and age <= LIVE_WINDOW_S:
-            return True
-    return False
+    return activity_age(entry) <= LIVE_WINDOW_S
 
 
 def species_from_out(out):
@@ -194,8 +218,11 @@ def species_from_out(out):
     return ""
 
 
-def normalize_extra(row, owner):
-    """外部 driver 台账的一行 -> 主台账那套列名，让下面的循环认不出来差别。"""
+def normalize_extra(row, owner, source_tz=0.0):
+    """外部 driver 台账的一行 -> 主台账那套列名，让下面的循环认不出来差别。
+
+    时间统一换算成显示口径（UTC+8）：源台账写的是 UTC，转过来「最近完成」才排得对、标得一致。
+    """
     out = (row.get("out") or "").strip()
     state = (row.get("state") or "").strip().lower()
     size = (row.get("size") or "").strip()
@@ -205,32 +232,38 @@ def normalize_extra(row, owner):
         size_gb = "%.3f" % (int(size) / (1024 ** 3))
 
     species = species_from_out(out)
+    raw_ts = (row.get("ts") or "").strip()
     entry = {
         "species_name": ("%s·%s" % (owner, species)) if species else owner,
         "status": EXTRA_STATES.get(state, state.upper()),
         "path": os.path.dirname(out),
         "size_gb": size_gb,
-        "updated": (row.get("ts") or "").strip(),
+        "updated": raw_ts,
         "notes": os.path.basename(out),
         "owner": owner,
         "genbank": (row.get("genbank") or "").strip(),
     }
-    age = text_age(entry["updated"])
-    if age is not None:
-        entry["updated_age_s"] = int(age)
+    epoch = text_epoch(raw_ts, source_tz)
+    if epoch is not None:
+        entry["updated"] = cst_text(epoch)              # 显示统一 UTC+8
+        entry["updated_epoch"] = int(epoch)
+        entry["updated_age_s"] = int(max(0.0, time.time() - epoch))
     return entry
 
 
 def extra_rows():
     """读所有 EXTRA_LEDGERS，返回 (归一化后的行, 来源清单)。读不到某份就跳过，不影响主台账。"""
     rows, ledgers = [], []
-    for pattern, owner, kind in EXTRA_LEDGERS:
+    for spec in EXTRA_LEDGERS:
+        pattern, owner, kind = spec[0], spec[1], spec[2]
+        source_tz = spec[3] if len(spec) > 3 else 0.0
         for path in sorted(glob.glob(os.path.expanduser(pattern))):
             try:
                 raw = load_rows(path)
             except (OSError, UnicodeDecodeError):
                 continue
-            mapped = [normalize_extra(r, owner) for r in raw] if kind == "extra" else []
+            mapped = ([normalize_extra(r, owner, source_tz) for r in raw]
+                      if kind == "extra" else [])
             rows.extend(mapped)
             ledgers.append({"csv": path, "owner": owner, "rows": len(mapped)})
     return rows, ledgers
@@ -376,6 +409,14 @@ def snapshot(csv_path, limit, previous, previous_at):
         if row.get("updated_age_s") is not None:
             entry["updated_age_s"] = row["updated_age_s"]
 
+        # 时间：extra 行在 normalize 时已换算好；主台账的行在这里按 MAIN_TZ_H 换算。
+        # 两边的 epoch 都拿到，「最近完成」才排得出实际顺序（+8 与 UTC 比字符串会倒序）。
+        epoch = row.get("updated_epoch")
+        if epoch is None and entry["updated"]:
+            epoch = text_epoch(entry["updated"], MAIN_TZ_H)
+        if epoch is not None:
+            entry["updated_epoch"] = int(epoch)
+
         if status in ACTIVE_STATES:
             info, _ = progress_of(row)
             if info:
@@ -389,10 +430,13 @@ def snapshot(csv_path, limit, previous, previous_at):
         elif status in DONE_STATES:
             recent.append(entry)
 
-    # 在下任务：真在传输的排前面，其次按进度、物种名
-    active.sort(key=lambda e: (not e.get("live"), -(e.get("percent") or -1), e.get("species", "")))
-    # 最近完成：按台账 updated 时间倒序（字符串就是可排序的时间格式）
-    recent.sort(key=lambda e: e.get("updated", ""), reverse=True)
+    # 在下任务：真在传输的排前面；其次按「最近动过」（三路活性里最新的一路，即实际顺序），
+    # 再次按进度、物种名。三路都没动过的排最后 —— 它们是待重排队的残留。
+    active.sort(key=lambda e: (not e.get("live"), activity_age(e), -(e.get("percent") or -1),
+                               e.get("species", "")))
+    # 最近完成：按 epoch 倒序。**不能比字符串** —— 主台账写 CST(+8)、alt 台账写 UTC，
+    # 混排时 18:41(CST)=10:41Z 会排到 15:58Z 前面，看着像时间倒流。
+    recent.sort(key=lambda e: e.get("updated_epoch") or 0, reverse=True)
     recent = recent[:limit]
 
     # 速度：只在 watch 模式下有上一帧可比
