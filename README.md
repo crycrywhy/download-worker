@@ -7,15 +7,17 @@
 
 ---
 
-## 本仓库包含两部分
+## 本仓库包含三部分
 
 | 目录 | 是什么 | 文档 |
 |---|---|---|
 | **仓库根目录**（`installer/`、`worker/`） | **Windows 侧**：把一台 Windows PC 装成下载出口（本 README 的主体，从下一节开始） | 本文件 |
 | **`mcp/`** | **MCP 适配层**：把 Linux 侧调用这套出口的下载系统包装成 MCP Server，任何 MCP 客户端都能用工具调用发起下载、查进度、看出口健康状况 | [`mcp/README.md`](mcp/README.md) |
+| **`linux/`** | **Linux 侧只读视图**：`dw_tasks.py` 把 Linux 上的下载台账读成一帧 JSON，供 Windows 侧的 `download-worker status` / `process` 显示「Linux 现在派了什么活、各自下到哪」 | 本文件 [Linux 侧任务视图](#linux-侧任务视图dw_taskspy) |
 
-两者可以分开用：只想要「Windows 家宽当下载出口」，看完本文件就够了；
-想让 agent（Claude Code 等）直接调下载，再看 `mcp/`。
+三者可以分开用：只想要「Windows 家宽当下载出口」，看完本文件就够了；
+想让 agent（Claude Code 等）直接调下载，再看 `mcp/`；
+只想要一个「Linux 端下载队列的命令行仪表盘」，单独拿走 `linux/dw_tasks.py` 也行（纯标准库、只读）。
 
 ---
 
@@ -131,6 +133,7 @@ cd <复制路径>\installer
 | `-LinuxProxyHost`、`-LinuxProxyPort`、`-LinuxProxyType`、`-LinuxProxyLocalPort`、`-DisableLinuxProxy` | — | **已废弃（r5 反向隧道代理）**：为免旧命令行直接报错而保留，`host`+`port`（+`type`）会被折算进 `-WorkerProxy` 并打印 WARN；`-LinuxProxyLocalPort` 接受但忽略；`-DisableLinuxProxy` 等价于 `-WorkerProxy off` |
 | `-LogSyncRemoteDir` | `/home/<LinuxUser>/script/download-worker/log` | 日志同步到 Linux 的目标目录 |
 | `-LinuxWorkerPoolPath` | `~/script/download-worker/worker_pool.py` | Linux 侧 worker 池脚本路径。`download-worker on/off` 通过它同步本机在池里的启用状态（见「手动开关」） |
+| `-LinuxDwTasksPath` | `~/script/download-worker/dw_tasks.py` | Linux 侧只读任务视图路径。`download-worker status` / `process` 通过它显示 Linux 的下载队列与进度（见「[Linux 侧任务视图](#linux-侧任务视图dw_taskspy)」） |
 | `-LogSyncIntervalMinutes` | `5` | 日志同步周期 |
 | `-SkipLogSyncTask` | 关 | 不创建日志同步计划任务 |
 | `-PipIndexUrl` | 无（PyPI） | pip 镜像，如 `https://pypi.tuna.tsinghua.edu.cn/simple` |
@@ -325,6 +328,7 @@ download-worker proxy http://<代理IP>:<端口>   # 设 Worker 自己的代理�
 download-worker proxy socks5h://<代理IP>:<端口>
 download-worker proxy off           # 清掉代理，只走直连
 download-worker test 268435455      # 实测这台 PC 的下载速度（走配置里的代理）
+download-worker process             # 实时看 Linux 侧的下载队列与进度（Ctrl+C 退出）
 ```
 
 > 代理只进 `worker-config.json` 并立刻被 worker.py 读到，**不需要 restart**；指向本机回环（`127.0.0.1` / `localhost`，也就是私人代理）会被当场拒绝。
@@ -352,6 +356,24 @@ download-worker test 256M -Direct                       # 绕开代理，测直�
 > 没生效多半是窗口没重开（PATH 是进程启动时读的）。等不及就关掉窗口重开，或直接用全路径：
 > `<InstallDir>\download-worker.ps1 -Action off`。
 
+### `process` = 实时看 Linux 侧的下载队列
+
+```powershell
+download-worker process             # 每 2 秒刷新一帧，Ctrl+C 退出
+download-worker process -ProcessInterval 5   # 换成 5 秒一帧
+```
+
+把 Linux 侧「现在派了什么活、各自下到哪」画在终端里，**原地刷新**（同 `curl` 进度表的做法，不是一路往下滚）：上面是台账总览（各状态各多少条）+ 当前在下的任务（百分比、已下字节、物种/文件名、实测速度、状态），下面是最近完成的 5 条。正在传输的排在前面、行首带 `>`；挂在台账里但当前没在动的（多为中断残留、等重排队）用灰色显示，超过 8 条只列前 8 条并附一行汇总。
+
+| 项 | 说明 |
+|---|---|
+| 数据来源 | Linux 侧 `dw_tasks.py`（见 [Linux 侧任务视图](#linux-侧任务视图dw_taskspy)），经 `ssh <linux_user>@<linux_host>` 取；**只读**，不碰下载器、不改任何配置 |
+| 速度 | 由 Linux 侧相邻两帧的字节差算出，只有 `process` 有（`status` 是单帧，给不出速度） |
+| 退出 | **Ctrl+C**：ssh 与 PowerShell 同属一个控制台，中断会同时送到两边；本地 ssh 一死，远端脚本下一次写 stdout 就自己收摊，不会留孤儿进程 |
+| 失败时 | 一帧都拿不到会提示，并给出可手动执行的 `ssh <user>@<host> "python3 <path> --text"` |
+
+> 需要 Linux 侧存在 `dw_tasks.py`（默认 `~/script/download-worker/dw_tasks.py`，即本仓库的 `linux/dw_tasks.py`；路径可用安装参数 `-LinuxDwTasksPath` 改）。没有它时 `process` 与 `status` 的 Linux 段只会打一行提示，**其余功能不受影响**。
+
 ### `off` = 整机下线（用户确认的语义）
 
 | 步骤 | 动作 |
@@ -362,7 +384,7 @@ download-worker test 256M -Direct                       # 绕开代理，测直�
 | 4 | 通过 `ssh <linux_user>@<linux_host>` 执行 `worker_pool.py --set-enabled <port> false`：Linux 池里这个口标记为**人为关闭**，调度器不会再往它派任务，**也不会**因为端口不通而报掉线告警 |
 
 `on` 是反向操作：删 `paused.flag` → 启用并启动计划任务 → 轮询 `/health`（最多 30 秒）→ 同步 `--set-enabled <port> true`。
-`status` 打印：开关状态（paused.flag）、**当前带宽上限**（读 `logs\bandwidth.json`；若最近 10 分钟有下载，另附一条实测算得的均速）、**下载出口（直链 / 代理，附各自 IP，见下节）**、三个计划任务状态、本安装目录的进程、`/health`、Linux 池里该口的 enabled/状态。
+`status` 打印：开关状态（paused.flag）、**当前带宽上限**（读 `logs\bandwidth.json`；若最近 10 分钟有下载，另附一条实测算得的均速）、**下载出口（直链 / 代理，附各自 IP，见下节）**、三个计划任务状态、本安装目录的进程、`/health`、Linux 池里该口的 enabled/状态，以及**Linux 侧的下载队列**（见下节）。
 
 几点须知：
 
@@ -389,6 +411,26 @@ download-worker test 256M -Direct                       # 绕开代理，测直�
 
 装好后还没跑过下载（或本机 `worker.py` 仍是旧版）时，这一行显示 WARN「日志里没有 [NETWORK] 记录」，不是故障。
 直连 / 代理各自的**链路**与切换规则见前面的「代理出口（下载流量走哪条路）」一节。
+
+## Linux 侧任务视图（`dw_tasks.py`）
+
+[`linux/dw_tasks.py`](linux/dw_tasks.py) 是给 Windows 侧 `status` / `process` 供数的**只读**脚本：纯 Python 标准库、不依赖第三方包、不写任何文件、不动下载器。它读两份**已经存在**的产物，拼成一帧 JSON：
+
+| 来源 | 提供什么 |
+|---|---|
+| 下载台账 CSV（默认自动探测 `~/.config/download-worker/download_status.csv` 等位置，也可 `--status-csv` / 环境变量 `DW_STATUS_CSV` 指定） | 各状态计数、当前在下（`DOWNLOADING` / `REPAIRING`）、最近完成 |
+| 在下任务目录里的断点文件 `<输出文件>.download.json` | 精确进度（已完成块 → 字节 → 百分比）、块计数、断点文件新鲜度 |
+
+> 下载器一开始就把目标文件 **sparse 预分配到全尺寸**，所以 `ls -l` 的大小**不代表进度**；唯一可靠的两个来源就是断点文件与已分配块数（后者作为退路）。
+
+```bash
+python3 dw_tasks.py --json        # 一次性快照（download-worker status 用）
+python3 dw_tasks.py --watch 2     # 每 2 秒一行 JSONL（download-worker process 用）
+python3 dw_tasks.py --text        # 人看的表格（在 Linux 上直接跑）
+python3 dw_tasks.py --limit 5     # 「最近完成」显示几条（默认 5）
+```
+
+`--watch` 是 JSONL：一行一个对象、写完即 flush，管道断开（Ctrl+C / ssh 掉线）就退出，不会僵在那里。列名认得几种常见写法（`species_name`/`species`/`name`、`size_gb`/`size`…），缺列只是少一项信息，不会报错。
 
 ## HTTP API
 

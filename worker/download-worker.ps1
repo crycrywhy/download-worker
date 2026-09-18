@@ -3,7 +3,8 @@
 
   Usage (any terminal, after running the installer):
       download-worker              # = download-worker status
-      download-worker status       # tasks / processes / health / last tunnel events
+      download-worker status       # tasks / processes / health / Linux-side queue
+      download-worker process      # live view of the Linux-side downloads (Ctrl+C exits)
       download-worker off          # take this PC out of the download pool (整机下线)
       download-worker on           # put it back
       download-worker restart      # restart worker + tunnel, keep the on/off state
@@ -43,7 +44,7 @@
 
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("status", "on", "off", "restart", "proxy", "test")]
+    [ValidateSet("status", "on", "off", "restart", "proxy", "test", "process")]
     [string]$Action = "status",
 
     # "proxy": the proxy url to set, or "off"/"none" to clear it (omit = show it).
@@ -58,7 +59,10 @@ param(
     [string]$Arg2,
 
     # "test": sample the DIRECT route even when a proxy is configured.
-    [switch]$Direct
+    [switch]$Direct,
+
+    # "process": seconds between two live frames (default 2).
+    [int]$ProcessInterval = 2
 )
 
 $ErrorActionPreference = "Stop"
@@ -81,6 +85,7 @@ $CurlExe         = Join-Path $env:SystemRoot "System32\curl.exe"
 # range-friendly, no credentials, same target the manual speed tests used.
 $DefaultTestUrl  = "https://sra-pub-run-odp.s3.amazonaws.com/sra/SRR21672224/SRR21672224"
 $DefaultPoolPath = "~/script/download-worker/worker_pool.py"   # ~ is expanded by the Linux login shell
+$DefaultTasksPath = "~/script/download-worker/dw_tasks.py"  # ~ is expanded by the Linux login shell
 
 function Write-Head { param([string]$Text) Write-Host ""; Write-Host ("== " + $Text) -ForegroundColor Cyan }
 function Write-Ok   { param([string]$Text) Write-Host ("  [ OK ]  " + $Text) -ForegroundColor Green }
@@ -333,6 +338,160 @@ function Sync-LinuxRegistry {
     }
 }
 
+function Get-TasksPath {
+    # Linux 侧只读任务视图（dw_tasks.py）。和 linux_worker_pool_path 一样：旧配置没有
+    # 这个键就回默认值（~ 由 Linux 登录 shell 展开）。
+    $cfg = Get-Cfg
+    if ($null -ne $cfg -and $null -ne $cfg.linux_dw_tasks_path) {
+        $path = "$($cfg.linux_dw_tasks_path)".Trim()
+        if ($path) { return $path }
+    }
+    return $DefaultTasksPath
+}
+
+function Get-LinuxTasks {
+    # 跑一次 Linux 侧 dw_tasks.py --json，拿回那一帧对象；失败返回 $null（并说明原因）。
+    param([int]$Limit = 5, [switch]$Quiet)
+
+    $cfg = Get-Cfg
+    if ($null -eq $cfg -or -not $cfg.linux_user -or -not $cfg.linux_host) {
+        if (-not $Quiet) { Write-Warn2 "linux_user/linux_host 未配置，读不到 Linux 侧任务" }
+        return $null
+    }
+
+    $taskScript = Get-TasksPath
+    $command = "python3 {0} --json --limit {1}" -f $taskScript, $Limit
+    $target  = "{0}@{1}" -f $cfg.linux_user, $cfg.linux_host
+
+    # 原生程序写 stderr 不该中断脚本（和 Sync-LinuxRegistry 同一套处理）。
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = & $SshExe -o BatchMode=yes -o ConnectTimeout=10 $target $command 2>&1
+        $code = $LASTEXITCODE
+    }
+    catch {
+        $output = "$_"
+        $code = -1
+    }
+    finally {
+        $ErrorActionPreference = $previous
+    }
+
+    # ssh 自己的报错行混在 stderr 里；JSON 一定是唯一以 { 开头的那行。
+    $text = @($output) | Where-Object { "$_".TrimStart() -like "{*" } | Select-Object -First 1
+    if (-not $text) {
+        if (-not $Quiet) {
+            Write-Warn2 ("Linux 侧任务脚本没有输出（exit {0}）：{1}" -f $code, ("$output").Trim())
+            Write-Info  ("  手动确认：ssh {0} `"python3 {1} --text`"" -f $target, $taskScript)
+        }
+        return $null
+    }
+
+    try { return ($text | ConvertFrom-Json) }
+    catch {
+        if (-not $Quiet) { Write-Warn2 ("Linux 侧任务输出解析失败：{0}" -f $_) }
+        return $null
+    }
+}
+
+function Format-TaskSize {
+    # 台账里的 size_gb 可能是空、0 或非数字 —— 一律渲染成等宽文本，不要抛异常。
+    param($Entry)
+    $value = 0.0
+    if ($null -ne $Entry -and $null -ne $Entry.size_gb) {
+        [void][double]::TryParse("$($Entry.size_gb)", [System.Globalization.NumberStyles]::Float,
+            [System.Globalization.CultureInfo]::InvariantCulture, [ref]$value)
+    }
+    if ($value -gt 0) { return ("{0,7:N1} GB" -f $value) }
+    return (" " * 11)
+}
+
+function Get-TasksLines {
+    # 一帧 Linux 侧任务 → 一组 {Text, Color} 行。
+    # status 逐行打印（带颜色），process 原地重绘（拼等宽文本）。
+    # MaxActive：在下任务最多列几条。台账里 DOWNLOADING 常挂着几十条中断残留，
+    # 全列会把终端刷满、process 的面板更会被窗口高度截掉 —— 真的在传的排在最前，
+    # 够看就行，剩下的用一行汇总交代。
+    param($Frame, [int]$Recent = 5, [int]$MaxActive = 8)
+
+    $out = New-Object System.Collections.ArrayList
+    $indent = "          "                       # 与 Write-Info 同缩进
+
+    if ($null -eq $Frame) {
+        [void]$out.Add(@{ Text = ($indent + "Linux 侧任务：取不到（ssh 没通，或 dw_tasks.py 不在默认路径）"); Color = "Yellow" })
+        return $out
+    }
+    if ($Frame.ok -eq $false) {
+        [void]$out.Add(@{ Text = ($indent + ("Linux 侧任务：" + $Frame.error)); Color = "Yellow" })
+        if ("$($Frame.hint)") {
+            [void]$out.Add(@{ Text = ($indent + "  " + $Frame.hint); Color = "" })
+        }
+        return $out
+    }
+
+    $counts = @()
+    if ($null -ne $Frame.counts) {
+        foreach ($prop in $Frame.counts.PSObject.Properties) { $counts += ("{0}={1}" -f $prop.Name, $prop.Value) }
+    }
+    [void]$out.Add(@{ Text = ("  [ OK ]  " + ("Linux 侧任务台账：共 {0} 条   {1}" -f $Frame.total, ($counts -join "  "))); Color = "Green" })
+    [void]$out.Add(@{ Text = ($indent + ("台账：{0}   生成：{1} @ {2}" -f $Frame.csv, $Frame.generated, $Frame.host)); Color = "" })
+
+    $active = @($Frame.active | Where-Object { $null -ne $_ })
+    [void]$out.Add(@{ Text = ($indent + ("在下 {0} 个（其中正在传输 {1} 个）：" -f $active.Count, $Frame.active_live)); Color = "" })
+    if ($active.Count -eq 0) {
+        [void]$out.Add(@{ Text = ($indent + "  （没有 DOWNLOADING / REPAIRING 的任务）"); Color = "DarkGray" })
+    }
+    $shown = $active
+    if ($MaxActive -gt 0 -and $active.Count -gt $MaxActive) { $shown = $active[0..($MaxActive - 1)] }
+    foreach ($task in $shown) {
+        $percent = "  ?  "
+        if ($null -ne $task.percent) { $percent = ("{0,5:N1}%" -f [double]$task.percent) }
+        $speed = ""
+        if ($null -ne $task.speed_bps -and [double]$task.speed_bps -gt 0) {
+            $speed = ("{0,7:N2} MiB/s" -f ([double]$task.speed_bps / 1MB))
+        }
+        $mark = "  "
+        if ($task.live) { $mark = "> " }        # > = sidecar 还新鲜，此刻真在传输
+        $species = "$($task.species)"
+        if ($species.Length -gt 34) { $species = $species.Substring(0, 34) }
+        $color = ""
+        if (-not $task.live) { $color = "DarkGray" }   # 灰 = 台账里挂着但没在动（中断残留）
+        [void]$out.Add(@{ Text = ($indent + ("{0}{1}  {2}  {3,-34} {4}{5}" -f `
+            $mark, $percent, (Format-TaskSize $task), $species, $task.status, $speed)); Color = $color })
+        if ("$($task.file)") {
+            [void]$out.Add(@{ Text = ($indent + "       " + $task.file); Color = "DarkGray" })
+        }
+    }
+
+    if ($shown.Count -lt $active.Count) {
+        [void]$out.Add(@{ Text = ($indent + ("  … 另有 {0} 条在下（当前没有传输，多为待重排队的残留）" -f ($active.Count - $shown.Count))); Color = "DarkGray" })
+    }
+
+    $recent = @($Frame.recent | Where-Object { $null -ne $_ })
+    [void]$out.Add(@{ Text = ($indent + ("最近完成 {0} 条：" -f $recent.Count)); Color = "" })
+    if ($recent.Count -eq 0) {
+        [void]$out.Add(@{ Text = ($indent + "  （台账里还没有 DONE / REPAIRED 的记录）"); Color = "DarkGray" })
+    }
+    foreach ($task in $recent) {
+        $species = "$($task.species)"
+        if ($species.Length -gt 34) { $species = $species.Substring(0, 34) }
+        [void]$out.Add(@{ Text = ($indent + ("  {0}  {1,-34} {2}  {3}" -f `
+            (Format-TaskSize $task), $species, $task.status, $task.updated)); Color = "" })
+    }
+
+    return $out
+}
+
+function Show-TasksBlock {
+    # status 用：把一帧渲染到终端（带颜色）。
+    param($Frame, [int]$Recent = 5, [int]$MaxActive = 8)
+    foreach ($line in (Get-TasksLines -Frame $Frame -Recent $Recent -MaxActive $MaxActive)) {
+        if ("$($line.Color)") { Write-Host $line.Text -ForegroundColor $line.Color }
+        else { Write-Host $line.Text }
+    }
+}
+
 function Show-Status {
     $cfg = Get-Cfg
     $port = Get-Port
@@ -439,6 +598,12 @@ function Show-Status {
     $health = Test-Health
     if ($health) { Write-Ok ("本机 Worker /health：{0}" -f "$health".Trim()) }
     else { Write-Warn2 ("本机 Worker /health 无响应（已试 {0}:{1}；Worker 没在跑？）" -f ((Get-WorkerHosts) -join "/"), (Get-WorkerPort)) }
+
+    # Linux 侧的队列：这台 PC 的隧道口接到的活就来自这里。慢（一次 ssh，1 s 上下），
+    # 所以放在最后；取不到只报一行，不影响上面本机状态的可读性。
+    Write-Host ""
+    Write-Head "Linux 侧下载队列（正在派送 + 进度）"
+    Show-TasksBlock -Frame (Get-LinuxTasks -Limit 5) -MaxActive 8
 
     if (Test-Path $TunnelLog) {
         Write-Host ""
@@ -792,6 +957,107 @@ function Invoke-Test {
     }
 }
 
+function Invoke-Process {
+    # 实时看 Linux 侧在下什么：最近 5 条已完成 + 当前下载的进度与速度，原地刷新。
+    # Ctrl+C 直接退出 —— ssh 与 PowerShell 同属一个控制台，控制台中断会同时送到两边，
+    # 本地 ssh 一死，远端 python 下一次写 stdout 就拿到 EPIPE 自己收摊（不会留孤儿）。
+    param([int]$Interval = 2, [int]$Recent = 5)
+
+    Write-Head "download-worker process - Linux 侧下载任务（实时）"
+
+    $cfg = Get-Cfg
+    if ($null -eq $cfg -or -not $cfg.linux_user -or -not $cfg.linux_host) {
+        Write-Warn2 "linux_user/linux_host 未配置，读不到 Linux 侧任务"
+        return
+    }
+    if ($Interval -lt 1) { $Interval = 1 }
+    if ($Recent -lt 1) { $Recent = 1 }
+
+    $taskScript = Get-TasksPath
+    $target  = "{0}@{1}" -f $cfg.linux_user, $cfg.linux_host
+    $command = "python3 {0} --watch {1} --limit {2}" -f $taskScript, $Interval, $Recent
+
+    Write-Info ("来源：{0}    Linux 脚本：{1}" -f $target, $taskScript)
+    Write-Info ("刷新间隔：{0} s    最近完成：{1} 条" -f $Interval, $Recent)
+    Write-Info "Ctrl+C 退出。"
+    Write-Host ""
+
+    # 表格顶端：每帧回到这一行原地重绘，而不是一路往下滚（同 curl 进度表的做法）。
+    $top = 0
+    try { $top = [Console]::CursorTop } catch { }
+    $drawn = 0
+    $frames = 0
+
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $SshExe -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 $target $command 2>&1 |
+            ForEach-Object {
+                $line = "$_"
+                if ($line.TrimStart() -notlike "{*") {
+                    # ssh 自己的报错行 / 远端 traceback：直接打出来，别吞
+                    Write-Host ("    " + $line) -ForegroundColor DarkGray
+                    return
+                }
+
+                $frame = $null
+                try { $frame = $line | ConvertFrom-Json }
+                catch { Write-Host ("    帧解析失败：" + $_) -ForegroundColor Yellow; return }
+
+                $frames++
+                $lines = @(Get-TasksLines -Frame $frame -Recent $Recent -MaxActive 6)
+
+                $width = 100
+                try { if ([Console]::WindowWidth -gt 40) { $width = [Console]::WindowWidth - 1 } } catch { }
+
+                # 一帧比窗口还高就会把顶端顶出屏幕、原地重绘随之错位 —— 先按窗口高度截断。
+                $maxLines = 24
+                try { $maxLines = [Math]::Max(8, [Console]::WindowHeight - $top - 1) } catch { }
+
+                $texts = @(("  [ {0}   第 {1} 帧 ]" -f $frame.generated, $frames))
+                foreach ($l in $lines) { $texts += "$($l.Text)" }
+                if ($texts.Count -gt $maxLines) {
+                    $keep = $maxLines - 1
+                    $texts = @($texts[0..($keep - 1)]) + `
+                             @("          … 还有 {0} 行没显示（窗口高度不够，Ctrl+C 退出）" -f ($texts.Count - $keep))
+                }
+
+                try { [Console]::SetCursorPosition(0, $top) }
+                catch {
+                    # 输出被重定向时没有光标可定位：退化成顺序打印
+                    foreach ($t in $texts) { Write-Host $t }
+                    return
+                }
+
+                $blank = " " * $width
+                foreach ($text in $texts) {
+                    $shown = $text
+                    if ($shown.Length -gt $width) { $shown = $shown.Substring(0, $width) }
+                    [Console]::Write($shown.PadRight($width))
+                    [Console]::Write([Environment]::NewLine)
+                }
+                # 上一帧比这一帧长时，把多出来的行擦掉
+                for ($i = $texts.Count; $i -lt $drawn; $i++) {
+                    [Console]::Write($blank)
+                    [Console]::Write([Environment]::NewLine)
+                }
+                $drawn = $texts.Count
+            }
+    }
+    finally {
+        $ErrorActionPreference = $previous
+    }
+
+    if ($frames -eq 0) {
+        Write-Warn2 "一帧都没拿到 —— Linux 侧不可达，或 dw_tasks.py 不在默认路径"
+        Write-Info  ("  手动确认：ssh {0} `"python3 {1} --text`"" -f $target, $taskScript)
+    }
+    else {
+        Write-Host ""
+        Write-Ok ("已退出（共 {0} 帧）" -f $frames)
+    }
+}
+
 function Format-Duration {
     # 秒数 -> "12.3 分钟" / "1.4 小时" / "2.1 天"
     param([double]$Seconds)
@@ -902,4 +1168,5 @@ switch ($Action) {
     "restart" { Invoke-Restart }
     "proxy"   { Invoke-Proxy -Url $Arg1 }
     "test"    { Invoke-Test -Size $Arg1 -Url $Arg2 -Direct:$Direct }
+    "process" { Invoke-Process -Interval $ProcessInterval }
 }

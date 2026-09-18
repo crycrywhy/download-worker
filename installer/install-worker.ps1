@@ -146,6 +146,12 @@ param(
     # Linux checkout lives somewhere else.
     [string]$LinuxWorkerPoolPath = "~/script/download-worker/worker_pool.py",
 
+    # Path of the Linux-side read-only task view (dw_tasks.py).  `download-worker
+    # status` renders one snapshot of it and `download-worker process` streams it,
+    # so the Linux-side queue and the progress of each download are visible from
+    # the PC.  Read-only: it never writes anything on the Linux side.
+    [string]$LinuxDwTasksPath = "~/script/download-worker/dw_tasks.py",
+
     [switch]$SkipLogSyncTask,
 
     [string]$PipIndexUrl,
@@ -1147,6 +1153,7 @@ function Write-WorkerConfig {
         linux_host        = $ResolvedLinuxHost
         linux_tunnel_port = $LinuxTunnelPort
         linux_worker_pool_path = $LinuxWorkerPoolPath
+        linux_dw_tasks_path = $LinuxDwTasksPath
         log_sync          = [ordered]@{
             enabled          = (-not $SkipLogSyncTask)
             remote_dir       = $LogSyncRemoteDir
@@ -1972,10 +1979,10 @@ function Show-Summary {
         Write-Host "  see the WARN lines above (bandwidth is still set to the value shown above)" -ForegroundColor Yellow
     }
     if ($script:SwitchCommandOk) {
-        Write-Host "download-worker on|off|status               OK (any terminal; open a new one if PATH just changed)"
+        Write-Host "download-worker on|off|status|process       OK (any terminal; open a new one if PATH just changed)"
     }
     else {
-        Write-Host "download-worker on|off|status               NOT INSTALLED" -ForegroundColor Yellow
+        Write-Host "download-worker on|off|status|process       NOT INSTALLED" -ForegroundColor Yellow
         Write-Host "  see the WARN lines above (the worker itself is unaffected)" -ForegroundColor Yellow
     }
     if (Test-Path (Join-Path $InstallDir "paused.flag")) {
@@ -2074,6 +2081,16 @@ try {
 
         if ($existingPoolPath -and -not $PSBoundParameters.ContainsKey("LinuxWorkerPoolPath")) {
             $LinuxWorkerPoolPath = $existingPoolPath
+        }
+
+        # Same for linux_dw_tasks_path (this installer and later).
+        $existingTasksPath = $null
+        if ($null -ne $existing.PSObject.Properties["linux_dw_tasks_path"]) {
+            $existingTasksPath = "$($existing.linux_dw_tasks_path)".Trim()
+        }
+
+        if ($existingTasksPath -and -not $PSBoundParameters.ContainsKey("LinuxDwTasksPath")) {
+            $LinuxDwTasksPath = $existingTasksPath
         }
 
         Write-Log ("Keeping: worker_port={0}, linux_tunnel_port={1}" -f $WorkerPort, $LinuxTunnelPort)

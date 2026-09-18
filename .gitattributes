@@ -15,3 +15,6 @@ LICENSE text eol=lf
 
 # mcp/ runs on the Linux side — force LF there, overriding the Windows rules above
 mcp/**  text eol=lf
+
+# linux/ runs on the Linux side too (dw_tasks.py is executed there, not on the PC)
+linux/** text eol=lf
