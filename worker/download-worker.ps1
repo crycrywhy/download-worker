@@ -468,12 +468,15 @@ function Get-TasksLines {
         [void]$out.Add(@{ Text = ($indent + ("  … 另有 {0} 条在下（当前没有传输，多为待重排队的残留）" -f ($active.Count - $shown.Count))); Color = "DarkGray" })
     }
 
-    $recent = @($Frame.recent | Where-Object { $null -ne $_ })
-    [void]$out.Add(@{ Text = ($indent + ("最近完成 {0} 条：" -f $recent.Count)); Color = "" })
-    if ($recent.Count -eq 0) {
+    # 变量名必须叫 $recentList 之类 —— PowerShell 变量名**大小写不敏感**，
+    # 写成 $recent 就是上面那个 [int]$Recent 参数本身，把数组赋给 [int] 会当场抛
+    # ConvertToFinalInvalidCastException（$ErrorActionPreference=Stop 下直接打死 status）。
+    $recentList = @($Frame.recent | Where-Object { $null -ne $_ })
+    [void]$out.Add(@{ Text = ($indent + ("最近完成 {0} 条：" -f $recentList.Count)); Color = "" })
+    if ($recentList.Count -eq 0) {
         [void]$out.Add(@{ Text = ($indent + "  （台账里还没有 DONE / REPAIRED 的记录）"); Color = "DarkGray" })
     }
-    foreach ($task in $recent) {
+    foreach ($task in $recentList) {
         $species = "$($task.species)"
         if ($species.Length -gt 34) { $species = $species.Substring(0, 34) }
         [void]$out.Add(@{ Text = ($indent + ("  {0}  {1,-34} {2}  {3}" -f `
