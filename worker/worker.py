@@ -528,6 +528,80 @@ def validate_public_url(url: str):
     return parsed
 
 
+# ---------------------------------------------------------------------------
+# Live transfer snapshot (2026-09-18) - the data behind GET /status
+#
+# The Linux side's status broker polls /status to show what
+# each PC is transferring right now ("在传 <url>（worker 自报）").  Three rules
+# shaped this code:
+#
+#   * never block.  /status waits on no lock and touches no network - it only
+#     reads a snapshot the transfer handlers keep current.
+#   * never buffer.  /stream's streaming behaviour is untouched: the snapshot
+#     is a dict field assignment next to the existing byte counter, so no chunk
+#     is held back, split or copied.
+#   * one entry per in-flight request.  The Linux downloader opens several
+#     parallel Range requests (connections=2 by default, up to 4), so /status
+#     reports the most recently active one; url / task / client are identical
+#     across them anyway.
+#
+# uvicorn serves this app in a single process with a single event loop
+# (start_worker.py -> uvicorn.run(..., no workers=)), and the helpers below
+# never await, so a plain dict is safe here.  A lock would only add a way for
+# /status to block, which is exactly what it must not do.
+# ---------------------------------------------------------------------------
+
+_transfers = {}          # request id -> snapshot; "_"-prefixed keys are internal
+_transfer_ids = 0
+
+
+def transfer_begin(url, request):
+    """Register one in-flight transfer.  Returns (id, snapshot); never awaits."""
+    global _transfer_ids
+
+    _transfer_ids += 1
+    snapshot = {
+        "state": "downloading",
+        "url": url,
+        "task": request.headers.get("x-task") or "",
+        "client": request.headers.get("x-client") or "",
+        "range": request.headers.get("range") or "",
+        "bytes": 0,
+        "total": None,
+        "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+        # The request's own task, used as a liveness backstop by /status.  The
+        # endpoint and the response body run in the same task, so "task done"
+        # means "this transfer is over" - even on the one path the streaming
+        # iterator's finally cannot cover: a client that disconnects before the
+        # response body ever starts, which leaves that generator un-started.
+        "_task": asyncio.current_task(),
+        "_touched": time.monotonic(),
+    }
+
+    _transfers[_transfer_ids] = snapshot
+
+    return _transfer_ids, snapshot
+
+
+def transfer_progress(snapshot, sent):
+    """Bytes handed to the client so far, and the 'most recently active' stamp."""
+    snapshot["bytes"] = sent
+    snapshot["_touched"] = time.monotonic()
+
+
+def transfer_end(transfer_id):
+    """Drop one transfer.  A plain dict pop: safe to call twice, never blocks."""
+    _transfers.pop(transfer_id, None)
+
+
+def content_length_of(response):
+    """Content-Length of an upstream response as an int, or None."""
+    try:
+        return int(response.headers.get("content-length"))
+    except (TypeError, ValueError):
+        return None
+
+
 class DownloadRequest(BaseModel):
     url: str
     output: str
@@ -541,16 +615,48 @@ def health():
     }
 
 
+@app.get("/status")
+async def status():
+    """What this PC is transferring right now.  Unauthenticated, like /health.
+
+    {"state": "idle"} when nothing is in flight, otherwise the most recently
+    active transfer with url / task / client / range / bytes / total / started.
+
+    Must stay `async def`: FastAPI runs a *sync* handler in a worker thread, and
+    iterating _transfers from another thread while the event loop adds or drops
+    an entry would raise "dictionary changed size during iteration".  A
+    coroutine with no await runs to completion on the event loop, which is also
+    why no lock is needed - and no lock means nothing here can block.
+    """
+    # Backstop before answering: a transfer whose request task has finished is
+    # over, so drop it even if its streaming iterator never got the chance to
+    # clean up.  Building the list first keeps the dict from changing size
+    # mid-iteration (there is no await here, so this is the only writer).
+    for key in [key for key, item in _transfers.items()
+                if item["_task"] is not None and item["_task"].done()]:
+        del _transfers[key]
+
+    if not _transfers:
+        return {"state": "idle"}
+
+    snapshot = max(_transfers.values(), key=lambda item: item["_touched"])
+
+    return {key: value for key, value in snapshot.items() if not key.startswith("_")}
+
+
 @app.post("/download")
-async def download(req: DownloadRequest):
+async def download(req: DownloadRequest, request: Request):
     output = Path(req.output)
     output.parent.mkdir(parents=True, exist_ok=True)
 
     plan = build_route_plan(proxy_config())
 
+    transfer_id, snapshot = transfer_begin(req.url, request)
+
     try:
         client, response, route = await open_upstream(req.url, {}, plan)
     except httpx.TransportError as exc:
+        transfer_end(transfer_id)
         raise HTTPException(
             status_code=500,
             detail="{}: {} (routes tried: {})".format(
@@ -558,6 +664,11 @@ async def download(req: DownloadRequest):
                 ",".join(item.name for item in plan),
             ),
         )
+    except BaseException:
+        # Unexpected failure, or a caller that vanished mid-connect: drop the
+        # snapshot as it propagates, or /status would report it forever.
+        transfer_end(transfer_id)
+        raise
 
     try:
         if response.status_code >= 400:
@@ -567,10 +678,16 @@ async def download(req: DownloadRequest):
                 detail=detail.decode(errors="replace"),
             )
 
+        snapshot["total"] = content_length_of(response)
+
+        written = 0
         with open(output, "wb") as f:
             async for chunk in response.aiter_bytes(1024 * 1024):
                 f.write(chunk)
+                written += len(chunk)
+                transfer_progress(snapshot, written)
     finally:
+        transfer_end(transfer_id)
         await response.aclose()
         await client.aclose()
 
@@ -607,9 +724,15 @@ async def stream(request: Request, url: str):
 
     log_plan(url, headers, plan)
 
+    # Snapshotted before the upstream connect, not after: a connect that spends
+    # ~10s in DNS / route retries would otherwise read as "idle" on the broker
+    # board while this PC is in fact already working on the request.
+    transfer_id, snapshot = transfer_begin(url, request)
+
     try:
         client, response, route = await open_upstream(url, headers, plan)
     except httpx.TransportError as exc:
+        transfer_end(transfer_id)
         # Same status code as before the route layer existed; the body now names
         # the exits that were tried, which is what made past outages hard to read.
         raise HTTPException(
@@ -619,6 +742,11 @@ async def stream(request: Request, url: str):
                 ",".join(item.name for item in plan),
             ),
         )
+    except BaseException:
+        # Unexpected failure, or a client that vanished mid-connect: drop the
+        # snapshot as it propagates, or /status would report it forever.
+        transfer_end(transfer_id)
+        raise
 
     logger.info(
         "STREAM start host=%s status=%s range=%s",
@@ -632,11 +760,14 @@ async def stream(request: Request, url: str):
         detail = await response.aread()
         await response.aclose()
         await client.aclose()
+        transfer_end(transfer_id)
 
         raise HTTPException(
             status_code=status_code,
             detail=detail.decode(errors="replace"),
         )
+
+    snapshot["total"] = content_length_of(response)
 
     passthrough_headers = {}
 
@@ -661,6 +792,7 @@ async def stream(request: Request, url: str):
                 await bandwidth_limiter.acquire(len(chunk))
 
                 bytes_sent += len(chunk)
+                transfer_progress(snapshot, bytes_sent)
                 yield chunk
 
             elapsed = time.monotonic() - start_time
@@ -689,6 +821,10 @@ async def stream(request: Request, url: str):
             raise
 
         finally:
+            # Synchronous and first: a client aborting mid-stream is a normal
+            # way for a transfer to end here, and /status must stop reporting
+            # it even if the closes below are cancelled.
+            transfer_end(transfer_id)
             await response.aclose()
             await client.aclose()
 

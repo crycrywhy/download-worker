@@ -32,7 +32,7 @@ On the Windows PC that should become the download outlet:
    ```
    `-WorkerProxy` is optional: downloads are tried through it first and fall back to DIRECT; without it the Worker goes DIRECT only. It is the Worker's *own* proxy, dialled directly — the PC's private proxy (loopback) is refused. Change it later with `download-worker proxy <url>`.
 3. **Verify** — `installer\verify.cmd` (exit code `0` = everything checked out).
-4. **Use it from Linux** — `curl http://127.0.0.1:<端口>/health` -> `{"status":"ok","worker":"local-download-worker"}`.
+4. **Use it from Linux** — `curl http://127.0.0.1:<端口>/health` -> `{"status":"ok","worker":"local-download-worker"}`; `curl http://127.0.0.1:<端口>/status` -> 这台 PC 此刻在传什么（空闲时 `{"state":"idle"}`）。
    Data plane: `GET /stream?url=<public-url>` (passes `Range` through) and `POST /download` — see [HTTP API](#http-api).
 5. **Measure this PC** — `download-worker test 268435455` pulls 256 MiB through the configured exit (add `-Direct` to compare the direct route) and prints the real speed; nothing is written to disk.
 
@@ -439,6 +439,7 @@ Worker 是 FastAPI 应用，默认监听 `http://<Tailscale IP>:8765`；经隧�
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/health` | 存活探测：`{"status":"ok","worker":"local-download-worker"}` |
+| `GET` | `/status` | **此刻在传什么**（免鉴权、只读、立即返回）：空闲 `{"state":"idle"}`，在传则见下节 |
 | `GET` | `/stream?url=<公网 URL>` | **流式代理**：把上游字节流原样转发（`Range` 透传，便于分段 / 断点续传）；上游必须是 http/https 且解析到**公网 IP** |
 | `POST` | `/download` | 让 Windows 侧直接落盘：JSON `{"url": "<公网 URL>", "output": "<Windows 路径>"}` |
 
@@ -455,6 +456,32 @@ curl -s -X POST http://127.0.0.1:<端口>/download \
 ```
 
 `/stream` 的目标校验会拒绝解析到私有 / 回环 / 链路本地 / 保留 / 组播地址的 URL（防止把 Worker 当跳板打内网），只允许 `http` / `https`。
+
+### `GET /status`（在传任务快照）
+
+给 Linux 侧的状态看板用：调用方每隔几秒探一次，面板上就能显示「**这台 PC 正在传什么**」，而不是只看到「活着」。
+它**只读**（不改配置、不下载、不落盘）、**免鉴权**（与 `/health` 同级）、**立即返回**——读的是一份由传输线程维护的快照，不等待任何锁、不查上游。
+
+```jsonc
+// 空闲
+{"state": "idle"}
+// 在传：字段全部来自本次请求
+{"state": "downloading",
+ "url":    "https://ftp.sra.ebi.ac.uk/vol1/fastq/.../x.fastq.gz",
+ "task":   "ERR11785609",          // 请求头 X-Task，没发就是空串
+ "client": "dl_all_priority",      // 请求头 X-Client，没发就是空串
+ "range":  "bytes=0-268435455",    // 请求头 Range，没发就是空串
+ "bytes":  1048576,                // 本次已写出给调用方的字节数
+ "total":  1662560245,             // 上游 Content-Length；拿不到是 null
+ "started": "2026-09-18 15:17:01"} // 该请求开始的本机时间
+```
+
+几点须知：
+
+* **一条在传请求一条记录**。下载器按 `--connections` 开几条并发连接就有几条，`/status` 报**最近活跃的那一条**（同一次下载的 url / task / client 相同，只有 `range` 不同，所以看不出区别）。
+* `bytes` 的更新粒度 = `/stream` 现有的 1 MiB 块。**流式行为一个字没动**：为了统计去缓存或切小块都是不允许的，代价是慢速上游上 `bytes` 可能几秒才跳一次。
+* 请求在**连接上游之前**就登记（连上之前的那几秒也算「在传」），连接失败、上游 4xx/5xx、调用方中途断开都会立刻撤销登记；`/status` 每次被调用时还会顺手回收「请求任务已结束」的残留记录。
+* 返回的 `url` 是**完整 URL（含 query）**。S3 预签名 URL 的凭据就在 query 里，所以这个口和 `/health`、`/stream` 是同一个信任面：**只应暴露给可信任的本地调用方**（`/status` 本身不做任何鉴权，隧道口只绑 127.0.0.1）。
 
 ## 多台 Windows PC
 
@@ -514,6 +541,7 @@ linux_downloader.py
 * **监听面最小**：Worker 只绑定本机 Tailscale 地址，防火墙规则只放行 `100.64.0.0/10`。
 * **不出公网**：隧道是 Windows -> Linux 的反向连接，Windows 侧不需要公网 IP、不需要端口映射。
 * **SSRF 防护**：`/stream` 只接受能解析到公网 IP 的 http/https 目标；`/download` 由调用方决定落盘路径 —— 也就是说 **Worker 的控制口只应暴露给可信任的 Linux 侧**（它确实可以往 Windows 任意可写路径写文件，这是功能的一部分）。
+* **状态口只读**：`/status` 不解锁任何动作、不改任何状态，只回一份「当前在传什么」的快照，内容不超出本机调用方自己发起的请求。
 * **执行策略**：只有在你同意（或显式加 `-FixExecutionPolicy`）时，安装器才会把**当前用户**的策略设为 `RemoteSigned`；它不动机器级策略、不需要管理员。
 * **代理凭据**：`proxy.url` 可带用户名口令（`http://user:pass@host:port`），它只写进本机 `worker-config.json` 并用于建连；**日志、`status`、响应头里一律只出现 `host:port`**（回归测试 T9 守着这条）。指向本机回环的代理地址会被命令行与 worker.py **两层**拒绝，这台 PC 的私人代理不会因为误配而承载下载数据。
 
