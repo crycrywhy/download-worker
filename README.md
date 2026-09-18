@@ -64,7 +64,7 @@ Windows 本地网络出口 -> ENA / NCBI / GenomeArk / ...
 | 全配置化 | 本机 Tailscale IP、端口、Linux 用户/地址、日志目录全部来自 `worker-config.json`，包内没有任何机器特定值 |
 | 幂等 / 可升级 | 同一条命令重跑即升级；配置、虚拟环境、日志、带宽设置全部保留 |
 | 无窗口 | 两个长驻计划任务以 **S4U**（session 0）运行，不会出现控制台窗口，也不可能被误关 |
-| 自动恢复 | Worker 退出后 5 秒自动重启（`worker_supervisor.py`）；**隧道**同样有守护（`tunnel_supervisor.py`，退出即重启、5/10/30/60 秒退避），计划任务本身也带失败重启 |
+| 自动恢复 | Worker 退出后 5 秒自动重启（`worker_supervisor.py`）；**隧道**同样有守护（`tunnel_supervisor.py`，退出即重启、5/10/15/20/30 秒退避），计划任务本身也带失败重启 |
 | 手动开关 | `download-worker on` / `off` / `status`：随时把这台 PC 从下载池里摘出去或放回来（含 Linux 侧状态同步，不留假告警） |
 | 带宽控制 | 0-100%（0 = 暂停），`Get-WorkerBandwidth` / `Set-WorkerBandwidth` 两个命令 |
 | 日志轮转 + 回传 | 单文件 10 MB x 5 轮转；按周期增量同步回 Linux 侧 |
@@ -226,11 +226,15 @@ Windows 侧 Tailscale IP **自动检测**（`tailscale ip -4`，失败则回退�
 | `Local Download Log Sync` | `.venv\Scripts\pythonw.exe` | `sync_log.py` | 登录时 + 每 N 分钟 | Interactive | 无窗口（pythonw，短命进程） |
 
 三者共用：`RestartCount=3` / `RestartInterval=PT1M` / `ExecutionTimeLimit=PT0S`（不限时）/ `MultipleInstances=IgnoreNew`，以当前用户身份、最高权限运行。
-Worker 自身的进程级恢复由 `worker_supervisor.py` 负责（退出后等 5 秒重启），**隧道**由 `tunnel_supervisor.py` 负责（ssh 退出即重启，间隔按 5/10/30/60 秒退避、稳定跑满 60 秒则重置），不引入第三套 watchdog。
+Worker 自身的进程级恢复由 `worker_supervisor.py` 负责（退出后等 5 秒重启），**隧道**由 `tunnel_supervisor.py` 负责（ssh 退出即重启，间隔按 5/10/15/20/30 秒退避、稳定跑满 60 秒则重置；秒退时会把 `tunnel.log` 的最后一行 ssh 报错抄进自己的日志），不引入第三套 watchdog。
 
 > **为什么隧道也要守护**（2026-09-14 的一次真实事故）：任务计划自带的重启只在**任务失败退出**时生效；ssh 若自己正常退出（换网络 / 掉线 / 被对端断开），任务状态会停在 `Ready` 而没人拉它 —— 表现就是「PC 在线、worker 也在，但 Linux 侧那个端口连不上」。守护脚本把「拉起 ssh」变成一个永不退出的循环，同时它也顺带做到「开机/登录后一定会有隧道」。两件事都由计划任务 + 守护脚本闭环。
 
 > 守护脚本同样尊重「手动开关」：`download-worker off` 期间 worker 守护与隧道守护都不拉起进程（见下节）。
+
+> **隧道自己的探活设置**（`worker/start_tunnel.py` 里那几条 `-o`）：`ServerAliveInterval=15` + `ServerAliveCountMax=3` = 链路静默死掉后 **~45 秒**内 ssh 自己退出（有数据在流时探测会被抑制，所以短间隔不影响下载速度，只决定**空闲**隧道能在死链上挂多久）；`TCPKeepAlive=yes` 让系统层再看一道；`ConnectTimeout=15` 给建连也封顶，避免黑洞路由让 ssh 卡在 `connect()` 里、守护以为它还活着；`ExitOnForwardFailure=yes` 让「端口被占」这类问题立刻失败而不是假装健康；`LogLevel=VERBOSE` 把断开原因（`Timeout, server ... not responding`、`remote port forwarding failed`、`Connection reset by peer`…）留在 `tunnel.log`，否则日志只剩一句 `exit 255`，事后无从诊断。
+>
+> **客户端的探活救不了 Linux 侧的端口**：链路静默死亡时 Linux 那端收不到 FIN，只能等 TCP 自己超时，这期间端口仍被半开会话占着 —— 新隧道会以 `remote port forwarding failed` 立刻失败（守护因此退避重试，直到对端放开）。把这段等待缩短要靠 **Linux 侧**（识别并清掉端口上已死的 ssh），不属于本包。
 
 **为什么完全没有窗口**（两层保证）：
 
