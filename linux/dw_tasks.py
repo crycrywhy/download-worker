@@ -18,6 +18,19 @@
    ⚠ 下载器一开始就把目标文件 sparse 预分配到全尺寸，所以 `ls -l` 的大小**不代表进度**，
    唯一可靠的两个来源就是 sidecar 与已分配块数。
 
+3. **别的 driver 的台账 CSV**（`EXTRA_LEDGERS`，见下）—— 2026-09-18 用户定：「alt 的下载统一用
+   ds 同款 driver，用户在一个监控面看全部下载」。所以 alt 那条核基因组线的 state 台账也并进同一帧，
+   归属标签挂在物种名前面（`alt·Genus species`），Windows 侧渲染不用改。
+
+   | 归属 | 台账 | 列 |
+   |---|---|---|
+   | alt | `~/.config/download-worker/extra_ledgers/dl_status_*.csv` | `genbank,state,out,size,md5,ts` |
+
+   列名口径与主台账不同，`normalize_extra()` 归一化：物种名从 `out` 路径反推
+   （`<...>/genome/<Genus>/<Genus_species_taxid>/<file>`），状态映射
+   `downloading->DOWNLOADING / downloaded->DONE / failed->FAILED`。
+   这类行的 `ts` 是分钟精度的本地时间，也当一路活性信号用（见 `is_live`）。
+
 用法
 ----
     python3 dw_tasks.py --json            # 一次性快照（download-worker status 用）
@@ -29,6 +42,7 @@
 速度（`speed_bps`）只在 `--watch` 里有：靠相邻两次采样的差值算，一次性快照给不出速度。
 """
 import argparse
+import calendar
 import csv
 import glob
 import json
@@ -66,6 +80,24 @@ COLUMN_ALIASES = {
     "notes": ("notes", "note", "remark", "备注"),
 }
 
+# 别人的 driver 台账： (glob, 归属, 列口径)。用户定的「一个监控面看全部下载」，所以这些
+# 行并进同一帧的 active / recent / counts，只多了个归属前缀。要加新线就在这里加一行。
+EXTRA_LEDGERS = [
+    ("~/.config/download-worker/extra_ledgers/dl_status_*.csv", "alt", "extra"),
+]
+
+# 外部 driver 台账的 state 取值 -> 本脚本的状态口径
+EXTRA_STATES = {
+    "downloading": "DOWNLOADING",
+    "downloaded": "DONE",
+    "failed": "FAILED",
+    "queued": "QUEUED",
+    "pending": "QUEUED",
+}
+
+# 扫目录找「在写文件」时要跳过的后缀（sidecar / aria2 痕迹自己不是下载目标）
+SKIP_SUFFIXES = (".download.json", ".aria2", ".verified.json", ".aria2__temp")
+
 
 def now_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -92,6 +124,116 @@ def find_csv(explicit):
         if os.path.isfile(path):
             return path, checked
     return "", checked
+
+
+def text_age(text):
+    """台账里的时间文本 -> 年龄（秒）；认不出来返回 None。
+
+    用 timegm 而不是 mktime：这些台账写的是 UTC（服务器时区就是 UTC），不受进程 TZ 影响。
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return max(0.0, time.time() - calendar.timegm(time.strptime(text, fmt)))
+        except ValueError:
+            continue
+    return None
+
+
+def newest_file_age(directory):
+    """目录里最新那个「下载目标」的 mtime 年龄（秒）；没有返回 None。
+
+    这是 sidecar 之外的第二路活性信号：下载器每写完一块就写文件，文件 mtime 跟着动。
+    某些时候 sidecar 还没落（刚起、或上一轮刚被终验删掉）而文件在长，光看 sidecar 会误判成「没在传」。
+    """
+    newest = None
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return None
+    for name in names:
+        if name.startswith(".") or name.endswith(SKIP_SUFFIXES):
+            continue
+        try:
+            mtime = os.path.getmtime(os.path.join(directory, name))
+        except OSError:
+            continue
+        if newest is None or mtime > newest:
+            newest = mtime
+    return None if newest is None else max(0.0, time.time() - newest)
+
+
+def is_live(entry):
+    """三路取最新：sidecar 新鲜度 / 目标文件 mtime / 台账 ts（分钟精度）。
+
+    任一路落在 LIVE_WINDOW_S 内就算「此刻真在传输」。台账里挂着 DOWNLOADING 但三路都停了的，
+    是中断残留 —— 两者必须分开显示。
+    """
+    for key in ("sidecar_age_s", "mtime_age_s", "updated_age_s"):
+        age = entry.get(key)
+        if age is not None and age <= LIVE_WINDOW_S:
+            return True
+    return False
+
+
+def species_from_out(out):
+    """从 `<...>/genome/<Genus>/<Genus_species_taxid>/<file>` 反推物种名。
+
+    目录名形如 `Genus_species_0000`（属_种_taxid）=> `Genus species`。
+    反推不出来就返回空串（调用方退回 accession）。
+    """
+    parts = os.path.normpath(out or "").split(os.sep)
+    for chunk in reversed(parts[:-1]):          # 从文件名往上找第一个像物种目录的
+        bits = chunk.split("_")
+        if len(bits) > 2 and bits[-1].isdigit():
+            bits = bits[:-1]
+        if len(bits) >= 2 and all(bits):
+            return " ".join(bits)
+    return ""
+
+
+def normalize_extra(row, owner):
+    """外部 driver 台账的一行 -> 主台账那套列名，让下面的循环认不出来差别。"""
+    out = (row.get("out") or "").strip()
+    state = (row.get("state") or "").strip().lower()
+    size = (row.get("size") or "").strip()
+
+    size_gb = ""
+    if size.isdigit() and int(size) > 0:
+        size_gb = "%.3f" % (int(size) / (1024 ** 3))
+
+    species = species_from_out(out)
+    entry = {
+        "species_name": ("%s·%s" % (owner, species)) if species else owner,
+        "status": EXTRA_STATES.get(state, state.upper()),
+        "path": os.path.dirname(out),
+        "size_gb": size_gb,
+        "updated": (row.get("ts") or "").strip(),
+        "notes": os.path.basename(out),
+        "owner": owner,
+        "genbank": (row.get("genbank") or "").strip(),
+    }
+    age = text_age(entry["updated"])
+    if age is not None:
+        entry["updated_age_s"] = int(age)
+    return entry
+
+
+def extra_rows():
+    """读所有 EXTRA_LEDGERS，返回 (归一化后的行, 来源清单)。读不到某份就跳过，不影响主台账。"""
+    rows, ledgers = [], []
+    for pattern, owner, kind in EXTRA_LEDGERS:
+        for path in sorted(glob.glob(os.path.expanduser(pattern))):
+            try:
+                raw = load_rows(path)
+            except (OSError, UnicodeDecodeError):
+                continue
+            mapped = [normalize_extra(r, owner) for r in raw] if kind == "extra" else []
+            rows.extend(mapped)
+            ledgers.append({"csv": path, "owner": owner, "rows": len(mapped)})
+    return rows, ledgers
 
 
 def find_active_sidecar(directory):
@@ -143,8 +285,10 @@ def progress_of(row):
         return None, None
 
     sidecar, meta, age = find_active_sidecar(directory)
+    file_age = newest_file_age(directory)
     info = {"sidecar": os.path.basename(sidecar) if sidecar else "",
-            "sidecar_age_s": int(age) if age is not None else None}
+            "sidecar_age_s": int(age) if age is not None else None,
+            "mtime_age_s": int(file_age) if file_age is not None else None}
 
     if meta:
         size = meta.get("size") or 0
@@ -177,8 +321,7 @@ def progress_of(row):
             except OSError:
                 names = []
             for name in names:
-                if name.startswith(".") or name.endswith(
-                        (".download.json", ".aria2", ".verified.json", ".aria2__temp")):
+                if name.startswith(".") or name.endswith(SKIP_SUFFIXES):
                     continue
                 target = os.path.join(directory, name)
                 break
@@ -204,13 +347,18 @@ def load_rows(csv_path):
 
 
 def snapshot(csv_path, limit, previous, previous_at):
-    """读一次台账 + 扫一次在下任务，拼出这一帧。previous = 上一次的 {key: bytes_done}。"""
+    """读一次台账 + 扫一次在下任务，拼出这一帧。previous = 上一次的 {key: bytes_done}。
+
+    主台账 + 所有 EXTRA_LEDGERS（别的 driver 的线）合成一个列表处理：计数、在下、最近完成
+    都是「全部下载」的口径，归属只体现在物种名的 `alt·` 前缀与 `owner` 字段上。
+    """
     rows = load_rows(csv_path)
+    extra, ledgers = extra_rows()
     counts = {}
     active = []
     recent = []
 
-    for row in rows:
+    for row in rows + extra:
         status = pick(row, "status").upper()
         counts[status] = counts.get(status, 0) + 1
 
@@ -223,13 +371,20 @@ def snapshot(csv_path, limit, previous, previous_at):
             "updated": pick(row, "updated"),
             "note": pick(row, "notes"),
         }
+        if row.get("owner"):
+            entry["owner"] = row["owner"]
+        if row.get("updated_age_s") is not None:
+            entry["updated_age_s"] = row["updated_age_s"]
 
         if status in ACTIVE_STATES:
             info, _ = progress_of(row)
             if info:
                 entry.update(info)
-            age = entry.get("sidecar_age_s")
-            entry["live"] = bool(age is not None and age <= LIVE_WINDOW_S)
+                # 台账 size 列是空的（在下中的行往往还没量过），就用 sidecar 报的全文件大小补上，
+                # Windows 侧那一列才不是空白。
+                if not entry.get("size_gb") and info.get("bytes_total"):
+                    entry["size_gb"] = "%.3f" % (info["bytes_total"] / (1024 ** 3))
+            entry["live"] = is_live(entry)
             active.append(entry)
         elif status in DONE_STATES:
             recent.append(entry)
@@ -262,8 +417,9 @@ def snapshot(csv_path, limit, previous, previous_at):
         "generated": now_text(),
         "host": socket.gethostname(),
         "csv": csv_path,
+        "ledgers": ledgers,
         "counts": counts,
-        "total": len(rows),
+        "total": len(rows) + len(extra),
         "done": sum(counts.get(s, 0) for s in DONE_STATES),
         "pending": sum(counts.get(s, 0) for s in ACTIVE_STATES) + counts.get("QUEUED", 0),
         "active": active,
@@ -285,6 +441,8 @@ def render_text(frame):
     """人看的版本（Linux 上直接跑 dw_tasks.py --text）。"""
     print(f"== Linux 侧下载任务（{frame['generated']} @ {frame['host']}）")
     print(f"   台账：{frame['csv']}")
+    for ledger in frame.get("ledgers") or []:
+        print(f"   + {ledger['owner']} 台账：{ledger['csv']}（{ledger['rows']} 行）")
     line = "   ".join(f"{k}={v}" for k, v in sorted(frame["counts"].items()))
     print(f"   共 {frame['total']} 条：{line}")
     print()
