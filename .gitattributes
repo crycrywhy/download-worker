@@ -1,0 +1,24 @@
+# Files copied to a Windows machine must keep CRLF line endings on checkout,
+# otherwise .cmd / .ps1 can misbehave.
+*.py    text eol=crlf
+*.ps1   text eol=crlf
+*.psm1  text eol=crlf
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+*.txt   text eol=crlf
+*.json  text eol=crlf
+
+# documentation stays LF
+*.md    text eol=lf
+LICENSE text eol=lf
+.gitignore text eol=lf
+
+# mcp/ runs on the Linux side — force LF there, overriding the Windows rules above
+mcp/**  text eol=lf
+
+# linux/ runs on the Linux side too (dw_tasks.py is executed there, not on the PC)
+linux/** text eol=lf
+
+# tools/ is the Linux-side download chain — same reasoning as mcp/ and linux/.
+# Without this the *.py rule above would hand a Linux checkout CRLF scripts.
+tools/** text eol=lf

@@ -1,0 +1,42 @@
+# runtime artifacts (created by an installation, never part of the package)
+logs/
+*.log
+*.log.sync-state
+bandwidth.json
+worker-config.json
+.venv/
+
+# runtime artifacts created inside the tool directory (tools/) once a transfer has run.
+# A fresh clone has none of these; an installed one should not show them as changes.
+tools/state/
+tools/inbox/
+tools/lease/
+tools/broker.json
+tools/workers.json
+tools/worker_status.json
+
+# Python
+__pycache__/
+*.py[cod]
+
+# build products
+*.zip
+
+# editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# public-repo red-line auditor -- its pattern list IS the sensitive word list,
+# so it must never be part of the published tree
+.audit/
+
+# porting map -- it spells out the neutralisation term by term, i.e. it IS the
+# decoder for what the published tree deliberately stopped saying. Local only.
+tools/PORTING.md
+
+# the earlier front-end is kept beside the current one for rollback. It predates
+# the split into a generic chain and carries that era's vocabulary throughout, so
+# it is not part of the published tree -- roll back locally, not from here.
+mcp/legacy_frontend/
