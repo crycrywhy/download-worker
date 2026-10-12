@@ -88,6 +88,12 @@ def _progress(out):
         with open(side, encoding='utf-8') as f:
             d = json.load(f)
         total = int(d.get('size') or 0)
+        # Independent commit (urgent lane): chunks land out of order, so durable_bytes is
+        # only the prefix up to the first gap -- it stays at 0 while block 0 is missing.
+        # Prefer done_bytes (the sum of fsynced chunk lengths); older sidecars have no
+        # such key and fall through to durable_bytes below.
+        if d.get('done_bytes') is not None:
+            return int(d['done_bytes']), total, 'sidecar/done'
         if d.get('durable_bytes') is not None:
             return int(d['durable_bytes']), total, 'sidecar/durable'
         cc, cs = d.get('completed_chunks'), int(d.get('chunk_size') or 0)

@@ -76,6 +76,13 @@ SPEC = {
     'paths.stage_dir': Spec('path', '', 'STAGE_DIR', True,
                             'staging root on fast local storage; empty = write straight '
                             'to the destination'),
+    'paths.ssd_ledger_dir': Spec('path', '', 'SSD_LEDGER_DIR', False,
+                                 'directory holding the transfer ledger the caller side '
+                                 'writes (download.log / download_status_<port>.log); '
+                                 'empty = the real parent of stage_dir.  It sits on the '
+                                 'same fast storage as the staging area on purpose: the '
+                                 'outlet reads its progress from there in one small read, '
+                                 'never by walking a network mount'),
     'paths.alerts_file': Spec('path', os.path.join(_state_home(), 'download-worker', 'alerts.jsonl'),
                               ('WORKER_ALERTS', 'WORKER_ALERT_JSONL', 'WORKER_ALERTS_JSONL'), False,
                               'append-only alert stream; three env names accepted, first '
@@ -168,10 +175,20 @@ SPEC = {
                          'remote lines wait for this sentinel file to appear; empty = start now'),
     'ops.win_gate_max_wait': Spec('int', 48 * 3600, 'WIN_GATE_MAX_WAIT', False,
                                   'longest wait for the sentinel, in seconds'),
-    'ops.stage_high_gb': Spec('float', 100.0, 'STAGE_HIGH_GB', False,
-                              'staging usage above this pauses new work'),
-    'ops.stage_low_gb': Spec('float', 60.0, 'STAGE_LOW_GB', False,
-                             'drain to this level before resuming'),
+    'ops.stage_high_gb': Spec('float', 0.0, 'STAGE_HIGH_GB', False,
+                              'staging usage above this pauses new work; '
+                              '0 = derive it from the number of outlets (see below)'),
+    'ops.stage_low_gb': Spec('float', 0.0, 'STAGE_LOW_GB', False,
+                             'drain to this level before resuming; 0 = 60% of the high mark'),
+    'ops.stage_cap_gb': Spec('float', 500.0, 'STAGE_CAP_GB', False,
+                             'hard ceiling for the staging pool, whatever the outlet count'),
+    'ops.stage_base_gb': Spec('float', 100.0, 'STAGE_BASE_GB', False,
+                              'watermark baseline, i.e. what a single-outlet setup gets'),
+    'ops.stage_per_port_gb': Spec('float', 80.0, 'STAGE_PER_PORT_GB', False,
+                                  'how much the high mark grows per extra outlet'),
+    'ops.stage_other_gb': Spec('float', 50.0, 'STAGE_OTHER_GB', False,
+                               'space on the same volume that belongs to someone else; '
+                               'only ever reported on, never reclaimed automatically'),
     'ops.stage_max_file_gb': Spec('float', 90.0, 'STAGE_MAX_FILE_GB', False,
                                   'files larger than this bypass staging'),
     'ops.record_ledger': Spec('bool', False, None, False,

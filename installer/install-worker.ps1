@@ -160,6 +160,12 @@ param(
     # the PC.  Read-only: it never writes anything on the Linux side.
     [string]$LinuxDwTasksPath = "~/download-worker/linux/dw_tasks.py",
 
+    # Path of the Linux-side download ledger (ssd_ledger.py).  `download-worker
+    # status all` (and `status <port>`) reads the schedule it keeps on the shared
+    # SSD: what is queued next, what is running on which outlet, how far along,
+    # and who asked for it.  Read-only, like the task view.
+    [string]$LinuxSsdLedgerPath = "~/download-worker/tools/ssd_ledger.py",
+
     [switch]$SkipLogSyncTask,
 
     [string]$PipIndexUrl,
@@ -1170,6 +1176,7 @@ function Write-WorkerConfig {
         linux_tunnel_port = $LinuxTunnelPort
         linux_worker_pool_path = $LinuxWorkerPoolPath
         linux_dw_tasks_path = $LinuxDwTasksPath
+        linux_ssd_ledger_path = $LinuxSsdLedgerPath
         log_sync          = [ordered]@{
             enabled          = (-not $SkipLogSyncTask)
             remote_dir       = $LogSyncRemoteDir
@@ -2107,6 +2114,16 @@ try {
 
         if ($existingTasksPath -and -not $PSBoundParameters.ContainsKey("LinuxDwTasksPath")) {
             $LinuxDwTasksPath = $existingTasksPath
+        }
+
+        # Same for linux_ssd_ledger_path (this installer and later).
+        $existingLedgerPath = $null
+        if ($null -ne $existing.PSObject.Properties["linux_ssd_ledger_path"]) {
+            $existingLedgerPath = "$($existing.linux_ssd_ledger_path)".Trim()
+        }
+
+        if ($existingLedgerPath -and -not $PSBoundParameters.ContainsKey("LinuxSsdLedgerPath")) {
+            $LinuxSsdLedgerPath = $existingLedgerPath
         }
 
         # Same for worker_label (this installer and later).

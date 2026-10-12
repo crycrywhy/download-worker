@@ -58,6 +58,13 @@ python3 tools/dl_ctl.py show               # 队列 / 在跑的线 / 运行时�
   这条链默认会扫空洞并把有洞的文件隔离待重下。
 * **出口**：没配 worker 时用 `--direct` 直连；配了则默认走出口、失败可回落。
   出口侧（Windows Worker）的安装见本文件上文。
+* **进度不必去翻网络挂载**：driver 会把「谁在哪个口、下到哪了」写成一份台账放在中转盘
+  （`download.log` 全局 + `download_status_<port>.log` 单口，由 `tools/ssd_ledger.py` 维护）：
+  跟着派活自动建，任务彻底结束后 10 天自动清。PC 侧的 `download-worker status all` 和 MCP 的
+  `download_status` 读的就是它 —— **一次小读**，网络挂载打嗝时也秒回。
+* **中转盘水位随口数自动放大**：`ops.stage_base_gb` + `ops.stage_per_port_gb` × 出口数，
+  上限由 `ops.stage_cap_gb` 封顶（默认 500 GB）；涨到水位暂停取新任务，回落到 60% 再继续。
+  单文件超过 `ops.stage_max_file_gb` 的不走中转，直接落目的地。
 
 完整参数与口径见 [`mcp/用户手册.md`](mcp/用户手册.md)（那份手册同时是这条链的用户手册）。
 
@@ -374,6 +381,21 @@ download-worker process             # 实时看 Linux 侧的下载队列与进�
 ```
 
 > 代理只进 `worker-config.json` 并立刻被 worker.py 读到，**不需要 restart**；指向本机回环（`127.0.0.1` / `localhost`，也就是私人代理）会被当场拒绝。
+
+### `status all` / `status <port>` = 全局的下载安排与进度
+
+不带参数的 `status` 回答的是「**这台 PC 自己**怎么样」外加喂给它自己那个口的队列。带上参数问的是另一个问题：
+
+```powershell
+download-worker status all     # 整台下载池：所有口的安排与进度
+download-worker status <port>  # 只看某个口（"linux" = 服务器直连那条线）
+```
+
+它读的是**管家端写在中转盘上的下载台账**（`tools/ssd_ledger.py` 维护）：每行一个数据，写清它在哪个口、下到哪了、多大、谁申请的、什么时候开始。台账跟着派活自动建，任务彻底结束后 10 天自动清。
+
+为什么非要另立这一层：**进度必须是一次小读**。这台 PC 想看管家端的进度只有两条路 —— 走 SSH，或走网络挂载。而网络挂载病态时一次目录清单要几十秒（`dw_tasks.py` 那种遍历式视图会整块卡住）。台账把进度预先压成「少量文件 + 单次读」，所以 `status all` 在网络挂载打嗝时照样秒回。
+
+两种「读不出」都会**明说**，不会给一个看着像在跑的假状态：任务没走中转（老式直写目的地）→ 该行标 `error`；整份台账读不到 → 给一行原因，而不是一张空表。
 
 ### `test` = 在这台 PC 上实测下载速度
 

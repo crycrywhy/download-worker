@@ -336,6 +336,27 @@ def alive_urls(ports=None, spec=None, **kw):
     return [f'http://127.0.0.1:{p}' for p in alive_ports(ports=ports, spec=spec, **kw)]
 
 
+def configured_ports(reg=None, spec=None):
+    """The outlets named in the registry, with no probing at all.
+
+    Used to size things that scale per outlet, such as the staging watermark.  Those
+    must count configured outlets, not live ones: liveness dips whenever a probe is
+    slow or a mount is busy, and a budget that follows it makes the same machine
+    appear to accept work and then refuse it at random -- a symptom that is very hard
+    to trace back to its cause.
+    """
+    try:
+        r = reg if reg is not None else load_registry()
+    except Exception:
+        return []
+    if spec:
+        try:
+            return sorted(parse_range(spec, r))
+        except Exception:
+            return []
+    return sorted(int(p) for p in (r.get('workers') or {}))
+
+
 def pick_alive(ports=None, spec=None, **kw):
     urls = alive_urls(ports=ports, spec=spec, **kw)
     return random.choice(urls) if urls else None
@@ -585,7 +606,9 @@ def main(argv=None):
             print(f'(无状态文件 {STATUS_JSON}；哨兵未运行过？)')
             return 1
         if a.json:
-            print(json.dumps(st, ensure_ascii=False, indent=2))
+            # ensure_ascii=True：这段输出要走**标记分隔的单行协议**到对端，中文转义成
+            # \uXXXX，对端（中文 Windows，按 CP936 解码）才不会把 JSON 结构读坏。
+            print(json.dumps(st, ensure_ascii=True, indent=2))
             return 0
         print(f"worker 池状态（{STATUS_JSON}）更新于 {st.get('updated_utc8')} UTC+8")
         ws = st.get('workers', {})
@@ -637,11 +660,16 @@ def main(argv=None):
         return 0
 
     if a.json:
+        # Single line, not indented: this output crosses the wire inside a
+        # marker-delimited line protocol, where each segment must be one line so
+        # the reader never has to brace-match. A pretty-printed blob makes the
+        # older readers pick up a lone "{" and fail. Use the default table mode
+        # for human reading.
         print(json.dumps({
             'registry': WORKERS_JSON,
             'alive': sorted(p for p, d in res.items() if d.get('ok') is True),
             'ports': {str(p): d for p, d in sorted(res.items())},
-        }, ensure_ascii=False, indent=2))
+        }, ensure_ascii=True))
         return 0
 
     alive = [p for p, d in res.items() if d.get('ok') is True]

@@ -14,6 +14,10 @@ tools/lease/
 tools/broker.json
 tools/workers.json
 tools/worker_status.json
+# the writer takes a sibling lock next to the file it updates, so the lock shows
+# up even on runs that change nothing (e.g. a read-only probe). Ignore it too --
+# it is an empty 0-byte marker, never content.
+tools/worker_status.json.lock
 
 # Python
 __pycache__/

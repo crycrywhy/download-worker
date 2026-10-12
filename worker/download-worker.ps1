@@ -4,6 +4,8 @@
   Usage (any terminal, after running the installer):
       download-worker              # = download-worker status
       download-worker status       # tasks / processes / health / Linux-side queue
+      download-worker status all   # the whole download schedule + progress (SSD ledger)
+      download-worker status <port>  # ... just that outlet's ("linux" = the direct line)
       download-worker process      # live view of the Linux-side downloads (Ctrl+C exits)
       download-worker off          # take this PC out of the download pool (整机下线)
       download-worker on           # put it back
@@ -14,6 +16,14 @@
       download-worker proxy off                 # clear it (直连 only)
       download-worker test <bytes> [url]        # measure the real download speed here
       download-worker test 256M -Direct         # ... sample the direct route instead
+
+  "status all" / "status <port>" answer a different question from a bare "status".
+  A bare status is THIS PC's own health plus the queue feeding its own tunnel port.
+  With an argument it instead reads the download ledger the caller side maintains on
+  the shared SSD and prints the whole schedule: what is queued next, what is running
+  on which outlet, how far along it is, and who asked for it.  Only a few small files
+  are read (the SSD, not the network mount), so it stays responsive even when that
+  mount is slow -- which is exactly why the progress lives there.
 
   "test" pulls that many bytes (268435455, or 256M / 1G) of a public file with
   curl.exe and reports the measured speed, the same measurement as
@@ -47,6 +57,8 @@ param(
     [ValidateSet("status", "on", "off", "restart", "proxy", "test", "process")]
     [string]$Action = "status",
 
+    # "status": optional scope -- "all" for the whole download schedule, "linux" or a
+    #           port number for one outlet (omit = this PC's own view, unchanged).
     # "proxy": the proxy url to set, or "off"/"none" to clear it (omit = show it).
     # "test" : how many bytes to sample - a plain byte count ("268435455", the same
     #          number you would put after curl's -r 0-) or with a unit ("256M", "1G").
@@ -87,10 +99,18 @@ $CurlExe         = Join-Path $env:SystemRoot "System32\curl.exe"
 $DefaultTestUrl  = "https://proof.ovh.net/files/10Mb.dat"
 $DefaultPoolPath = "~/download-worker/tools/worker_pool.py"   # ~ is expanded by the Linux login shell
 $DefaultTasksPath = "~/download-worker/linux/dw_tasks.py"  # ~ is expanded by the Linux login shell
+$DefaultLedgerPath = "~/download-worker/tools/ssd_ledger.py"  # ~ is expanded by the Linux login shell
 # Two layers of timeout guard every ssh that a person is waiting on (see Get-SshKeepAliveArgs).
-# A normal remote call takes a few seconds; anything past this is stuck, not slow.
-$RemoteTimeoutSec = 20
+# The ceiling has to clear the SLOWEST honest call, not the average one: the task view reads the
+# ledger CSVs off a network mount, and that has been measured at ~45 s when the mount is having a
+# bad day (45 s wall vs 0.1 s CPU = pure I/O wait). At 20 s it was cut off EVERY time, so the view
+# never appeared at all -- a timeout that always fires is not a guard, it is an outage.
+$RemoteTimeoutSec = 60
 $PoolMarker       = "__POOL_SNAPSHOT__"
+# Each remote segment reports its OWN exit code through one of these (see Invoke-LinuxView).
+$TaskRcMarker     = "__TASK_RC__"
+$PoolRcMarker     = "__POOL_RC__"
+$LedgerRcMarker   = "__LEDGER_RC__"
 
 function Write-Head { param([string]$Text) Write-Host ""; Write-Host ("== " + $Text) -ForegroundColor Cyan }
 function Write-Ok   { param([string]$Text) Write-Host ("  [ OK ]  " + $Text) -ForegroundColor Green }
@@ -396,6 +416,17 @@ function Get-PoolPath {
     return $DefaultPoolPath
 }
 
+function Get-LedgerPath {
+    # Linux 侧 SSD 台账脚本（`status all` / `status <port>` 读的那个）。和
+    # linux_dw_tasks_path 一样：旧配置没这个键就回默认值（~ 由 Linux 登录 shell 展开）。
+    $cfg = Get-Cfg
+    if ($null -ne $cfg -and $null -ne $cfg.linux_ssd_ledger_path) {
+        $path = "$($cfg.linux_ssd_ledger_path)".Trim()
+        if ($path) { return $path }
+    }
+    return $DefaultLedgerPath
+}
+
 function Get-WorkerLabel {
     # 本机自报名。旧配置没有 worker_label ⇒ 回退到 COMPUTERNAME，已装的机器不必重跑安装器。
     $cfg = Get-Cfg
@@ -421,20 +452,31 @@ function Invoke-LinuxView {
     }
 
     $taskScript = Get-TasksPath
-    $command = "timeout {0} python3 {1} --json --limit {2}" -f $RemoteTimeoutSec, $taskScript, $Limit
+    $taskCmd = "timeout {0} python3 {1} --json --limit {2}" -f $RemoteTimeoutSec, $taskScript, $Limit
     # 通道过滤：老 Linux 脚本不认 --channel（会直接 argparse 报错、这块变"没输出"），
     # 所以部署顺序是「先更新 Linux 侧 dw_tasks.py，再换 PC 上的这个脚本」。
-    if ($Channel) { $command = "{0} --channel {1}" -f $command, $Channel }
+    if ($Channel) { $taskCmd = "{0} --channel {1}" -f $taskCmd, $Channel }
+
+    # 每段**各自**把退出码打回来。两段共用一条 ssh 就共用一个 ssh 退出码（= 最后一条命令的），
+    # 于是"第一段超时了"会被第二段的 0 盖掉，代码里那条专门的超时提示永远打不出来，
+    # 只能退化成笼统的"没有输出"—— 把"远端卡住"误报成"脚本没东西可显示"是两回事。
+    # 标记行必须用**双引号**包：单引号会把 `$?` 原样打出来（远端 shell 不展开），
+    # 于是 rc 永远是那三个字符、解析成 $null，两条"远端卡住"的提示一辈子打不出来 ——
+    # 这正是"超时被误报成没输出"的那个 bug，改单引号为双引号才是修好。
+    $taskSeg = "{{ {0} ; }} ; echo `"{1}`$?`"" -f $taskCmd, $TaskRcMarker
     if ($WithPool) {
         # 两段输出用一行标记隔开；任务那段超时了也照样跑池那段（用 `;` 不是 `&&`）。
-        $command = "{0}; echo '{1}'; timeout {2} python3 {3} --json" -f `
-            $command, $PoolMarker, $RemoteTimeoutSec, (Get-PoolPath)
+        $command = "{0} ; echo '{1}' ; timeout {2} python3 {3} --json ; echo `"{4}`$?`"" -f `
+            $taskSeg, $PoolMarker, $RemoteTimeoutSec, (Get-PoolPath), $PoolRcMarker
+    }
+    else {
+        $command = $taskSeg
     }
     $target = "{0}@{1}" -f $cfg.linux_user, $cfg.linux_host
     $run    = Invoke-LinuxSsh -Target $target -Command $command
     $lines  = @($run.Output)
 
-    # ssh 自己的报错行混在 stderr 里；JSON 一定是唯一以 { 开头的那行。
+    # ssh 自己的报错行混在 stderr 里，按分隔标记切开两段，各认各的。
     $splitAt = -1
     if ($WithPool) {
         for ($i = 0; $i -lt $lines.Count; $i++) {
@@ -453,33 +495,69 @@ function Invoke-LinuxView {
     }
 
     $frame = $null
-    $text = @($taskLines) | Where-Object { "$_".TrimStart() -like "{*" } | Select-Object -First 1
-    if (-not $text) {
+    $taskRc = Get-SegmentRc -Lines $taskLines -Marker $TaskRcMarker
+    $blob   = Get-JsonBlob -Lines $taskLines
+    if (-not $blob) {
         if (-not $Quiet) {
-            if ($run.Code -eq 124) {
+            if ($taskRc -eq 124) {
                 Write-Warn2 ("Linux 侧任务脚本超过 {0}s 没返回，已放弃（远端卡住，不是本机问题）" -f $RemoteTimeoutSec)
             }
             else {
-                Write-Warn2 ("Linux 侧任务脚本没有输出（exit {0}）：{1}" -f $run.Code, ("$($run.Output)").Trim())
+                Write-Warn2 ("Linux 侧任务脚本没有输出（exit {0}）：{1}" -f `
+                    $taskRc, ((@($taskLines) -join " ").Trim() -replace "\s+", " "))
             }
             Write-Info  ("  手动确认：ssh {0} `"python3 {1} --text`"" -f $target, $taskScript)
         }
     }
     else {
-        try { $frame = $text | ConvertFrom-Json }
+        try { $frame = $blob | ConvertFrom-Json }
         catch { if (-not $Quiet) { Write-Warn2 ("Linux 侧任务输出解析失败：{0}" -f $_) } }
     }
 
     $pool = $null
-    if ($WithPool -and $poolLines.Count -gt 0) {
-        $poolText = @($poolLines) | Where-Object { "$_".TrimStart() -like "{*" } | Select-Object -First 1
-        if ($poolText) {
-            try { $pool = $poolText | ConvertFrom-Json }
+    if ($WithPool) {
+        $poolRc = Get-SegmentRc -Lines $poolLines -Marker $PoolRcMarker
+        $pblob  = Get-JsonBlob -Lines $poolLines
+        if ($pblob) {
+            try { $pool = $pblob | ConvertFrom-Json }
             catch { if (-not $Quiet) { Write-Warn2 ("Linux 侧池快照解析失败：{0}" -f $_) } }
+        }
+        elseif ($poolRc -eq 124 -and -not $Quiet) {
+            # 没输出时不再一律静默：超时是"远端卡住"，与"探活脚本没话说"要分开说。
+            Write-Warn2 ("Linux 侧池探活超过 {0}s 没返回（远端卡住）" -f $RemoteTimeoutSec)
         }
     }
 
     return @{ Frame = $frame; Pool = $pool }
+}
+
+function Get-SegmentRc {
+    # 取回某一段尾部的 `<标记><n>` 行里的 n（没有该行、或不是数字 ⇒ $null）。
+    param($Lines, [string]$Marker)
+    foreach ($l in @($Lines)) {
+        $t = "$l".Trim()
+        if ($t.StartsWith($Marker)) {
+            $n = 0
+            if ([int]::TryParse($t.Substring($Marker.Length), [ref]$n)) { return $n }
+        }
+    }
+    return $null
+}
+
+function Get-JsonBlob {
+    # 从"ssh 的输出行"里抠出 JSON 正文：**第一个 `{` 到最后一个 `}`**。
+    #
+    # 不要按行挑"以 { 开头的那一行"—— Linux 侧脚本两种形态都有：dw_tasks.py 是单行
+    # json.dumps，worker_pool.py 是 `indent=2` 的**行美化**（续行以 `"` 开头、末行是 `}`）。
+    # 按行挑时美化那种只会拿到一个孤零零的 `{`，解析必然报"传入的对象无效"。
+    # 整段扫首尾花括号对两种形态都成立，顺带把 rc 标记行与 ssh 噪声排除在外。
+    param($Lines)
+    $s = (@($Lines) -join "`n")
+    $i = $s.IndexOf("{")
+    if ($i -lt 0) { return $null }
+    $j = $s.LastIndexOf("}")
+    if ($j -lt $i) { return $null }
+    return $s.Substring($i, $j - $i + 1)
 }
 
 function Get-LinuxTasks {
@@ -646,7 +724,276 @@ function Write-Participation {
     }
 }
 
+function Format-LedgerSize {
+    # 字节数 → 人读。**不定宽**（要不要对齐由调用方的格式串决定）；读不出就 "--"。
+    param($Bytes)
+    $n = 0.0
+    $txt = "$Bytes".Trim()
+    if (-not $txt) { return "--" }
+    if (-not [double]::TryParse($txt, [System.Globalization.NumberStyles]::Float,
+            [System.Globalization.CultureInfo]::InvariantCulture, [ref]$n)) { return "--" }
+    if ($n -le 0) { return "--" }
+    foreach ($unit in @("B", "KiB", "MiB", "GiB", "TiB")) {
+        if ([Math]::Abs($n) -lt 1024 -or $unit -eq "TiB") {
+            if ($unit -eq "B") { return ("{0:N0} B" -f $n) }
+            return ("{0:N2} {1}" -f $n, $unit)
+        }
+        $n = $n / 1024
+    }
+    return "--"
+}
+
+function Invoke-LedgerView {
+    # 一条 ssh 取回 SSD 台账的 JSON，返回 @{ Data = <解析后的对象或 $null>; Target = <ssh 目标> }。
+    #
+    # 为什么单独一条 ssh、不并进 Invoke-LinuxView 那条：
+    #   ① 台账段只有 `status all` / `status <port>` 才要，并进去会让**默认的** status 白等一趟；
+    #   ② `status all` 不该顺带走网络挂载 —— 那条路上的一次清单读取要几十秒（挂载病态时更久），
+    #      而这套台账存在的**全部理由**就是「只读 SSD 上那几个小文件」，慢的源一律不碰。
+    param([string]$Scope = "", [switch]$Quiet)
+
+    $cfg = Get-Cfg
+    if ($null -eq $cfg -or -not $cfg.linux_user -or -not $cfg.linux_host) {
+        if (-not $Quiet) { Write-Warn2 "linux_user/linux_host 未配置，读不到 SSD 台账" }
+        return @{ Data = $null; Target = "" }
+    }
+
+    $script = Get-LedgerPath
+    $cmd = "timeout {0} python3 {1} --json" -f $RemoteTimeoutSec, $script
+    if ($Scope -and $Scope -ne "all") { $cmd = "{0} --port {1}" -f $cmd, $Scope }
+    $seg = "{{ {0} ; }} ; echo `"{1}`$?`"" -f $cmd, $LedgerRcMarker
+    $target = "{0}@{1}" -f $cfg.linux_user, $cfg.linux_host
+    $run = Invoke-LinuxSsh -Target $target -Command $seg
+    $lines = @($run.Output)
+
+    $rc   = Get-SegmentRc -Lines $lines -Marker $LedgerRcMarker
+    $blob = Get-JsonBlob -Lines $lines
+    if (-not $blob) {
+        if (-not $Quiet) {
+            if ($rc -eq 124) {
+                Write-Warn2 ("SSD 台账读取超过 {0}s 没返回（远端卡住，不是本机问题）" -f $RemoteTimeoutSec)
+            }
+            else {
+                Write-Warn2 ("SSD 台账没有输出（exit {0}）：{1}" -f `
+                    $rc, ((@($lines) -join " ").Trim() -replace "\s+", " "))
+            }
+            Write-Info  ("  手动确认：ssh {0} `"python3 {1}`"" -f $target, $script)
+        }
+        return @{ Data = $null; Target = $target }
+    }
+    try { return @{ Data = ($blob | ConvertFrom-Json); Target = $target } }
+    catch {
+        if (-not $Quiet) { Write-Warn2 ("SSD 台账解析失败：{0}" -f $_) }
+        return @{ Data = $null; Target = $target }
+    }
+}
+
+function Get-LedgerLines {
+    # 一帧 SSD 台账 → 一组 {Text, Color} 行（和 Get-TasksLines 同一套约定）。
+    #
+    # **语义的权威在 ssd_ledger.py**（写台账的就是那个模块）：这里只读它算好的字段，
+    # 不在 PC 侧重算百分比或归属 —— 同一个数两处各算一遍，迟早会算出两个值，
+    # 而"哪个对"没人说得清。
+    param($Data, [string]$Scope = "", [int]$MaxActive = 12, [int]$MaxDone = 5)
+
+    $out = New-Object System.Collections.ArrayList
+    $indent = "          "
+
+    $meta = $null
+    $rows = @()
+    if ($null -ne $Data) {
+        $meta = $Data.meta
+        if ($null -ne $Data.rows) { $rows = @($Data.rows | Where-Object { $null -ne $_ }) }
+    }
+
+    # ---- 抬头 + 逐口汇总 ----
+    # 汇总由写入侧算好（`_port_summary`）：在跑 / 完成 / 失败**各是条数**，
+    # 在跑字节数另用 run_size 这一对键 —— 两者混用会把"完成 700 字节"读成"完成 700 个任务"。
+    $title = "全局"
+    if ($Scope -and $Scope -ne "all") { $title = $Scope }
+    $ts = "--"
+    if ($null -ne $meta -and "$($meta.ts)") { $ts = "$($meta.ts)" }
+    [void]$out.Add(@{ Text = ("== SSD 下载台账（" + $title + "）  " + $ts); Color = "Cyan" })
+
+    $ports = $null
+    if ($null -ne $meta) { $ports = $meta.ports }
+    $anyPort = $false
+    if ($null -ne $ports) {
+        foreach ($prop in $ports.PSObject.Properties) {
+            $anyPort = $true
+            $s = $prop.Value
+            $line = "  [ OK ]  {0,-6} 在跑 {1} / 完成 {2} / 失败 {3}" -f `
+                $prop.Name, [int]$s.running, [int]$s.n_done, [int]$s.n_fail
+            if ([double]$s.run_size -gt 0) {
+                $line += ("   在跑合计 {0} / {1} ({2:N1}%)" -f `
+                    (Format-LedgerSize $s.run_done), (Format-LedgerSize $s.run_size), [double]$s.pct)
+            }
+            if ([double]$s.win_used_gb -gt 0) {
+                $line += ("   SSD 窗口 {0:N2} GB" -f [double]$s.win_used_gb)
+            }
+            [void]$out.Add(@{ Text = $line; Color = "Green" })
+        }
+    }
+    if (-not $anyPort) {
+        [void]$out.Add(@{ Text = ($indent + "（台账里还没有端口 —— 管家端还没派过活？）"); Color = "DarkGray" })
+    }
+
+    # ---- SSD 水位（这套改造把水池放宽到 500 GB，水位随口数自动抬高）----
+    if ($null -ne $meta -and [double]$meta.stage_high_gb -gt 0) {
+        $how = "显式指定"
+        if ("$($meta.gb_auto)" -eq "True") { $how = "随口数自动：口 " + "$($meta.np_ports)" }
+        $used = "--"
+        if ($null -ne $meta.stage_gb) { $used = Format-LedgerSize ([double]$meta.stage_gb * 1e9) }
+        [void]$out.Add(@{ Text = ($indent + ("SSD 水位上限 {0:N0} GB（{1}）；当前占用 {2}" -f `
+            [double]$meta.stage_high_gb, $how, $used)); Color = "" })
+    }
+
+    # ---- 接下来的安排：**队列在 meta 里、不在任务行里** ----
+    # 排队的任务还没有归属的口、也没有终态，写成任务行就永远过不掉 10 天的清理门，
+    # 会在台账里变成一堆幽灵行（写入侧刻意没那么做，这里跟着读 meta）。
+    $queue = @()
+    if ($null -ne $meta -and $null -ne $meta.queue) { $queue = @($meta.queue) }
+    if ($queue.Count -gt 0) {
+        [void]$out.Add(@{ Text = ""; Color = "" })
+        [void]$out.Add(@{ Text = ($indent + ("接下来的工作安排（队列队头 {0} 条）：" -f $queue.Count)); Color = "" })
+        $i = 0
+        foreach ($e in $queue) {
+            $i++
+            $nm = "$($e.name)";       if ($nm.Length -gt 40) { $nm = $nm.Substring(0, 40) }
+            $sp = "$($e.item)";       if ($sp.Length -gt 26) { $sp = $sp.Substring(0, 26) }
+            [void]$out.Add(@{ Text = ($indent + ("{0,3}. {1,-40} {2,-5} {3,-26} {4}" -f `
+                $i, $nm, "$($e.platform)", $sp, "$($e.requester)")); Color = "" })
+        }
+    }
+
+    # ---- 任务行 ----
+    $mine = $rows
+    if ($Scope -and $Scope -ne "all") {
+        $mine = @($rows | Where-Object { "$($_.port)" -eq "$Scope" })
+    }
+    $active = @($mine | Where-Object { "$($_.state)" -ne "done" })
+    $done   = @($mine | Where-Object { "$($_.state)" -eq "done" })
+
+    [void]$out.Add(@{ Text = ""; Color = "" })
+    if ($active.Count -eq 0) {
+        [void]$out.Add(@{ Text = ($indent + "在途与异常：0 条（此刻没有在下的任务）"); Color = "DarkGray" })
+    }
+    else {
+        [void]$out.Add(@{ Text = ($indent + ("在途与异常 {0} 条：" -f $active.Count)); Color = "" })
+    }
+    $shown = $active
+    if ($MaxActive -gt 0 -and $active.Count -gt $MaxActive) { $shown = $active[0..($MaxActive - 1)] }
+    foreach ($r in $shown) {
+        $pct = "  --  "
+        if ($null -ne $r.pct) { $pct = ("{0,5:N1}%" -f [double]$r.pct) }
+        $nm = "$($r.name)"; if ($nm.Length -gt 36) { $nm = $nm.Substring(0, 36) }
+        $color = ""
+        $state = "$($r.state)"
+        if ($state -eq "fail" -or $state -eq "error") { $color = "Yellow" }
+        elseif ($state -eq "queued") { $color = "DarkGray" }
+        [void]$out.Add(@{ Text = ($indent + ("{0,-6} {1,-8} {2,-36} {3}  {4} / {5}  {6}" -f `
+            "$($r.port)", $state, $nm, $pct, (Format-LedgerSize $r.done), (Format-LedgerSize $r.size),
+            "$($r.requester)")); Color = $color })
+        if ($null -ne $r.win_used -and [double]$r.win_used -gt 0) {
+            [void]$out.Add(@{ Text = ($indent + ("        SSD 窗口在途 " + (Format-LedgerSize $r.win_used))); Color = "DarkGray" })
+        }
+        if ("$($r.note)") {
+            [void]$out.Add(@{ Text = ($indent + "        " + "$($r.note)"); Color = "DarkGray" })
+        }
+    }
+    if ($shown.Count -lt $active.Count) {
+        [void]$out.Add(@{ Text = ($indent + ("  … 另有 {0} 条在途/异常未列出" -f ($active.Count - $shown.Count))); Color = "DarkGray" })
+    }
+
+    # ---- 最近完成（10 天窗口内的终态行；全列会把终端刷屏）----
+    $recent = @()
+    if ($done.Count -gt 0) {
+        $recent = @($done | Sort-Object -Property @{ Expression = { "$($_.ended)" } } -Descending)
+        if ($MaxDone -gt 0 -and $recent.Count -gt $MaxDone) { $recent = $recent[0..($MaxDone - 1)] }
+    }
+    [void]$out.Add(@{ Text = ""; Color = "" })
+    if ($done.Count -eq 0) {
+        [void]$out.Add(@{ Text = ($indent + "最近完成：台账里还没有已完成的行"); Color = "DarkGray" })
+    }
+    else {
+        # 括号里永远有话（全显示时也要说共几条）—— 空括号会渲染成"最近完成 ："，看着像出了错。
+        $tail = "（共 {0} 条）" -f $done.Count
+        if ($done.Count -gt $recent.Count) { $tail = "（共 {0} 条，显示最近 {1} 条）" -f $done.Count, $recent.Count }
+        [void]$out.Add(@{ Text = ($indent + "最近完成 " + $tail + "："); Color = "" })
+        foreach ($r in $recent) {
+            $nm = "$($r.name)"; if ($nm.Length -gt 36) { $nm = $nm.Substring(0, 36) }
+            [void]$out.Add(@{ Text = ($indent + ("{0,-6} {1,-36} {2}  {3}" -f `
+                "$($r.port)", $nm, (Format-LedgerSize $r.size), "$($r.ended)")); Color = "DarkGray" })
+        }
+    }
+
+    return $out
+}
+
+function Show-LedgerBlock {
+    # status all / status <port> 用：把一帧 SSD 台账渲染到终端（带颜色）。
+    param($Data, [string]$Scope = "")
+    foreach ($line in (Get-LedgerLines -Data $Data -Scope $Scope)) {
+        if ("$($line.Color)") { Write-Host $line.Text -ForegroundColor $line.Color }
+        else { Write-Host $line.Text }
+    }
+}
+
+function Show-StatusScope {
+    # `status all` / `status <port>`：**只看下载安排与进度**（SSD 台账）。
+    #
+    # 这是**新增的一条路**，默认的 `status`（不给参数）走 Show-Status 的老路、逐字节不变 ——
+    # 「原版 status 依旧只看自己」是这次改造的硬要求，所以宁可让本机那几项少写一遍，
+    # 也不去动老路的分支。本机健康仍照报（都是本地检查，不额外花时间），
+    # 只是省掉了老路里那块"给本机隧道口喂活的队列"——那个问题由台账回答得更全。
+    param([string]$Scope)
+
+    $cfg  = Get-Cfg
+    $port = Get-Port
+    $hosts  = @(Get-WorkerHosts)
+    $myAddr = if ($hosts.Count -gt 0) { "$($hosts[0])" } else { "(地址未取到)" }
+    $title = "全局下载安排"
+    if ($Scope -ne "all") { $title = "口 $Scope 的下载安排" }
+
+    Write-Head ("download-worker 状态（{0}）（{1}）" -f $title, $InstallDir)
+    Write-Info ("本机：{0}（隧道口(Linux) {1} / Worker(本机) {2} / {3}）" -f `
+        (Get-WorkerLabel), $port, (Get-WorkerPort), $myAddr)
+    if ($Scope -ne "all" -and "$Scope" -ne "$port") {
+        Write-Info ("  注意：本机是口 {0}，上面看的是口 {1} 的安排" -f $port, $Scope)
+    }
+
+    if (Test-Path $PauseFlag) { Write-Warn2 "本机已暂停（paused.flag 存在）——本机不会下载" }
+    else { Write-Ok "本机未暂停（正常参与下载）" }
+
+    $percent = Get-BandwidthPercent
+    if ($null -eq $percent) { Write-Warn2 "本机带宽：读不到 logs\bandwidth.json（Worker 按 100% 跑）" }
+    elseif ($percent -eq 0) { Write-Warn2 "本机带宽：PAUSED（0 MB/s）——恢复用 Set-WorkerBandwidth 100" }
+    else { Write-Ok ("本机带宽：{0}%（≈ {1} MB/s）" -f $percent, ($percent / 10)) }
+
+    $sups = @(Get-InstallProcess -Pattern "_supervisor.py")
+    $ssh  = @(Get-CimInstance Win32_Process -Filter "Name = 'ssh.exe'" -ErrorAction SilentlyContinue |
+              Where-Object { $_.CommandLine -like ("*-R " + $port + ":*") })
+    if ($sups.Count -gt 0) { Write-Info ("supervisor 进程：{0} 个" -f $sups.Count) }
+    else { Write-Warn2 "supervisor 进程：0 个（暂停状态下属正常；否则请 download-worker on）" }
+    if ($ssh.Count -gt 0) { Write-Info ("ssh 反向隧道进程：{0} 个（-R {1}）" -f $ssh.Count, $port) }
+    else { Write-Warn2 ("ssh 反向隧道进程：0 个（-R {0}）" -f $port) }
+
+    Write-Host ""
+    $view = Invoke-LedgerView -Scope $Scope
+    if ($null -eq $view.Data) {
+        Write-Info "（台账没读到；本机自身的状态用 download-worker status 看）"
+        return
+    }
+    Show-LedgerBlock -Data $view.Data -Scope $Scope
+    Write-Host ""
+    Write-Info ("台账脚本：{0}（在 {1} 上）" -f (Get-LedgerPath), $view.Target)
+    Write-Info "本机自身的状态（进程 / 代理 / 出口）：download-worker status"
+}
+
 function Show-Status {
+    param([string]$Scope = "")
+    if ("$Scope") { Show-StatusScope -Scope "$Scope"; return }
+
     $cfg = Get-Cfg
     $port = Get-Port
 
@@ -1327,7 +1674,18 @@ function Invoke-Restart {
 }
 
 switch ($Action) {
-    "status"  { Show-Status }
+    # status 的可选参数：all = 全局台账；<端口号> / linux = 某一个口的台账。
+    # **认不出来就明说并退出**，不要默默退回"只看自己" —— 打错一个字却看到一份
+    # 看似正常的本机状态，比报错更容易让人读错。
+    "status"  {
+        $scope = "$($Arg1)".Trim()
+        if ($scope -and $scope -notmatch '^(all|linux|[0-9]+)$') {
+            Write-Warn2 ("status 不认这个参数：'{0}'" -f $scope)
+            Write-Info  "  用法：download-worker status | status all | status <端口号> | status linux"
+            exit 2
+        }
+        Show-Status -Scope $scope
+    }
     "off"     { Invoke-Off }
     "on"      { Invoke-On }
     "restart" { Invoke-Restart }

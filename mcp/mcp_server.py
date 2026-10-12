@@ -24,6 +24,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))       # 本文件（MCP 本体）自己的目录
@@ -71,7 +72,8 @@ if not os.path.isfile(os.path.join(WORKER_DIR, 'dl_req.py')):
         "(this repo's tools/) and restart.\n" % WORKER_DIR)
 
 SERVER_NAME = 'download-worker'
-SERVER_VERSION = '2.0.0'
+# 2.1.0：工具调用改并发分发（长调用不再堵住整份 MCP）、修下载子进程僵尸。
+SERVER_VERSION = '2.1.0'
 PROTOCOL_FALLBACK = '2025-06-18'
 
 DL_REQ = os.path.join(WORKER_DIR, 'dl_req.py')
@@ -125,9 +127,15 @@ def log_err(msg):
     sys.stderr.flush()
 
 
+# 工具调用在各自线程里跑（见 handle），所以写 stdout 必须串行化 ——
+# 两条消息交错着写出去会得到两行都残缺的 JSON，比慢更糟。
+_WRITE_LOCK = threading.Lock()
+
+
 def write_message(obj):
-    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + '\n')
-    sys.stdout.flush()
+    with _WRITE_LOCK:
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + '\n')
+        sys.stdout.flush()
 
 
 def reply(rid, result):
@@ -160,6 +168,23 @@ def run(cmd, timeout=None, cwd=None):
         return (124, '', '命令超时（%ss）：%s' % (timeout or SCRIPT_TIMEOUT, ' '.join(cmd[:3])))
     except Exception as e:
         return (125, '', '%s: %s' % (type(e).__name__, e))
+
+
+def reap_child(p, close=None):
+    """等一个 detached 子进程收尾并收尸（丢给后台线程跑，别在主流程里 wait）。
+
+    `subprocess.run` 自己会 wait，所以**只有 Popen 出去放养的那些**需要这个 ——
+    常驻进程不义务收尸，孩子跑完就一直挂成 `<defunct>` 占着进程表。
+    """
+    try:
+        p.wait()
+    except Exception:
+        pass
+    if close is not None:
+        try:
+            close.close()
+        except Exception:
+            pass
 
 
 def read_json(path, default=None):
@@ -522,10 +547,22 @@ def tool_overview(a):
 # ---------------------------------------------------------------- 工具：download_status
 
 def tool_download_status(a):
-    """单个输出文件的进度：读既有 sidecar（`<output>.download.json`）+ 落地大小。"""
+    """下载进度。两种问法：
+
+      · 给 `output` → 那一个文件的进度（读既有 sidecar `<output>.download.json` + 落地大小）
+      · 不给（或给 `port`）→ **SSD 台账**：全局 / 某个口的安排与进度
+
+    台账那一份是**快**的那条路：它躺在中转盘上，一次小读就拿到全部在途进度，
+    不用去遍历网络挂载（病态时一次清单要几十秒）。没走中转的老任务读不出进度时
+    一律标 `error`，**不装作能看**。
+    """
     out_path = str(a.get('output') or '')
-    if not out_path:
-        return tool_err('download_status 需要 output')
+    if out_path:
+        return _download_status_one(out_path)
+    return _download_status_ledger(a.get('port'))
+
+
+def _download_status_one(out_path):
     side = out_path + '.download.json'
     sc = read_json(side)
     size = None
@@ -534,12 +571,29 @@ def tool_download_status(a):
     except OSError:
         size = None
     if sc is None and size is None:
+        # 老路（aria2c 直写目的地）只留一个 .aria2 控制文件，里面没有可读的进度度量。
+        # 口径：这种情况标 error，别给一个看着像"进行中"的假状态。
+        if os.path.exists(out_path + '.aria2'):
+            return tool_ok({'output': out_path, 'state': 'error',
+                            'note': '进度读不出：这个任务走的是老路（aria2c 直写，不经中转盘），'
+                                    '没有 .download.json sidecar。要看进度请让它走中转（driver 的 '
+                                    'SSD 台账），或直接看目标文件大小是否还在长',
+                            'on_disk_bytes': size})
         return tool_ok({'output': out_path, 'state': 'not_started'})
     done = sc.get('completed_chunks') if isinstance(sc, dict) else None
     total_chunks = None
     if isinstance(sc, dict) and sc.get('size') and sc.get('chunk_size'):
         total_chunks = (int(sc['size']) + int(sc['chunk_size']) - 1) // int(sc['chunk_size'])
     state = 'running_or_incomplete' if sc is not None else 'completed'
+    if isinstance(sc, dict) and sc.get('mode') == 'stream':
+        # 流式：进度看 durable_bytes（已经落到目的地的部分）。**不含窗口里还没刷出去的那截** ——
+        # 把窗口字节也算进来会让进度每隔一个 sync 周期往回跳一次。
+        return tool_ok({'output': out_path, 'state': state, 'mode': 'stream',
+                        'sidecar': side, 'size': sc.get('size'),
+                        'durable_bytes': sc.get('durable_bytes'),
+                        'on_disk_bytes': size,
+                        'note': 'stream = 边下边写目的地：durable_bytes 是已刷出的字节；'
+                                '中转盘窗口里在途的那部分不计入（否则进度会周期性回跳）'})
     return tool_ok({'output': out_path, 'state': state,
                     'sidecar': side if sc is not None else None,
                     'size': (sc or {}).get('size'), 'on_disk_bytes': size,
@@ -548,6 +602,54 @@ def tool_download_status(a):
                     'chunks_total': total_chunks,
                     'note': 'sidecar 存在 = 未完成（重跑同一条下载命令即续传）；'
                             '校验全过之后 downloader 才会删掉 sidecar'})
+
+
+def _download_status_ledger(port=None):
+    """SSD 台账视图（全局或单口）。台账模块缺失/读不到 → 明确报错，不猜。"""
+    try:
+        sys.path.insert(0, WORKER_DIR)
+        import ssd_ledger as _sl
+    except Exception as e:
+        return tool_err('读不到 SSD 台账模块（ssd_ledger.py 不在 %s？）：%s: %s'
+                        % (WORKER_DIR, type(e).__name__, e))
+    try:
+        port = str(port or '').strip()
+        if port:
+            data = _sl.read(port)
+            data['rows'] = [r for r in data.get('rows') or []
+                            if not _sl._expired(r, time.time(), _sl.TTL_DAYS)]
+            if not data['rows']:
+                # 「这个口没派活」和「这个口名写错了」在台账里长得一模一样（都是空）。
+                # 空结果最容易被读成"就是没数据"、而不是"你问错了"，所以这里把有活的口列出来，
+                # 让两种情形当场分得开。**不断言是拼错**：空闲的口生成的也正是这种空。
+                known = sorted((( _sl._read_file(_sl.global_path())[0] or {})
+                                .get('ports') or {}).keys())
+                return tool_ok({'ledger': data.get('path'), 'scope': port, 'ports': {},
+                                'total_rows': 0, 'rows': [],
+                                'note': '口 %s 现在没有行：可能确实没派活，也可能是口名写错了。'
+                                        '当前有行的口：%s' % (port, ', '.join(known) or '（一个都没有）')})
+        else:
+            # 全局**必须带回 meta**：逐口汇总、水位、"接下来的工作安排"（队列）只在首行 meta 里。
+            meta, _rows = _sl._read_file(_sl.global_path())
+            data = {'meta': meta, 'rows': _sl.read_all(), 'path': _sl.global_path()}
+    except Exception as e:
+        return tool_err('读 SSD 台账失败：%s: %s' % (type(e).__name__, e))
+    meta = data.get('meta') or {}
+    rows = data.get('rows') or []
+    return tool_ok({
+        'ledger': data.get('path'),
+        'scope': meta.get('scope') or (port or 'all'),
+        'as_of': meta.get('ts'),
+        'ports': meta.get('ports') or {},
+        'queue': meta.get('queue') or [],
+        'ssd_watermark_gb': meta.get('stage_high_gb'),
+        'ssd_watermark_auto': meta.get('gb_auto'),
+        'ssd_used_gb': meta.get('stage_gb'),
+        'total_rows': len(rows),
+        'rows': rows,
+        'note': '每行一个数据（按口归属）。state=error 的行 = 进度读不出（没走中转，'
+                '或线已消失）；state=done 的行进度按 size 补满。queue 是还没派活的队头。'
+                '这份台账在中转盘上，读它不碰网络挂载，所以比按文件问进度快得多'})
 
 
 # ---------------------------------------------------------------- 工具：download（租约感知）
@@ -630,7 +732,12 @@ def tool_download(a):
         p = subprocess.Popen(cmd, stdout=logf, stderr=logf, stdin=subprocess.DEVNULL,
                              cwd=WORKER_DIR, start_new_session=True)
     except Exception as e:
+        logf.close()
         return tool_err('起下载进程失败：%s: %s' % (type(e).__name__, e))
+    # **后台收尸**：本 MCP 是常驻进程，不 wait 的话下载进程跑完就变僵尸 ——
+    # 下面只 poll 一次，成功的那些再没人碰，于是 `<defunct>` 一直挂在进程表里。
+    # 收尸线程顺手关掉父进程这侧的日志 fd（子进程有自己的 dup，不受影响）。
+    threading.Thread(target=reap_child, args=(p, logf), daemon=True).start()
     time.sleep(1.0)
     # 判"成没成"要看**退出码**，不能只看"进程还在不在"：
     # 小文件不到 1 秒就下完了，那时进程早已正常退出 —— 只看存活会把一次
@@ -751,9 +858,12 @@ TOOLS = [
          "action": {"type": "string", "enum": ["status", "auto", "start", "finish"],
                     "description": "默认 status（只读）"}}}},
     {"name": "download_status",
-     "description": "单个输出文件的进度（读既有 sidecar，不自己实现下载逻辑）。",
-     "inputSchema": {"type": "object", "required": ["output"], "properties": {
-         "output": {"type": "string", "description": "输出文件路径（下载时传的那个）"}}}},
+     "description": "单个输出文件的进度（读既有 sidecar，不自己实现下载逻辑）。"
+                    "**不给 output（或只给 port）则读中转盘上的下载台账**："
+                    "不传 port = 全局的安排与进度，传 port = 那个口的。",
+     "inputSchema": {"type": "object", "properties": {
+         "output": {"type": "string", "description": "输出文件路径（下载时传的那个）"},
+         "port": {"type": "string", "description": "只看某个口（不给 = 全局；台账那条路用）"}}}},
     {"name": "download",
      "description": "**临时单文件**下载（不进队列）：租约感知（挑空口 + advisory 声明）、后台 detached 跑。"
                     "批量/正式任务请用 submit。",
@@ -783,6 +893,26 @@ INSTRUCTIONS = (
 
 # ---------------------------------------------------------------- 主循环
 
+def dispatch_tool(name, args, rid):
+    """在一个线程里跑完一条 tools/call，然后回响应（被 handle 派生）。"""
+    h = HANDLERS.get(name)
+    if h is None:
+        reply_error(rid, -32602, 'unknown tool: %r' % name)
+        return
+    log('tools/call %s args=%s' % (name, json.dumps(args, ensure_ascii=False)[:200]))
+    t0 = time.time()
+    try:
+        result = h(args)
+    except Exception as e:
+        log_err('tool %s crashed: %s: %s' % (name, type(e).__name__, e))
+        result = tool_err('internal error in %s: %s: %s' % (name, type(e).__name__, e))
+    took = time.time() - t0
+    if took >= 5:
+        # 慢调用留一行 —— 将来再有人报超时，先看这里有没有「谁按住了多久」。
+        log_err('slow tool %s took %.1fs' % (name, took))
+    reply(rid, result)
+
+
 def handle(msg):
     if not isinstance(msg, dict):
         return
@@ -800,17 +930,14 @@ def handle(msg):
     elif method == 'tools/call':
         params = msg.get('params') or {}
         name, args = params.get('name'), params.get('arguments') or {}
-        h = HANDLERS.get(name)
-        if h is None:
-            reply_error(rid, -32602, 'unknown tool: %r' % name)
-            return
-        log('tools/call %s args=%s' % (name, json.dumps(args, ensure_ascii=False)[:200]))
-        try:
-            result = h(args)
-        except Exception as e:
-            log_err('tool %s crashed: %s: %s' % (name, type(e).__name__, e))
-            result = tool_err('internal error in %s: %s: %s' % (name, type(e).__name__, e))
-        reply(rid, result)
+        # **每条工具调用一律丢线程，不在主循环里同步跑。**
+        # 主循环串行时，一个长调用会把整份 MCP 按住（`overview refresh` 能跑十分钟），
+        # 期间同 session 的**其它**调用只能排队 —— 而客户端自己也有请求超时，
+        # 先到点的那次就报 `-32001 Request timed out`；**超时只发生在客户端一侧**，
+        # 服务端那个子进程照样跑到底，于是这十分钟里谁都调不动。
+        # JSON-RPC 的响应自带 id，乱序返回是合法的；stdout 写入已加锁（见 write_message）。
+        # 不设线程池上限：把长调用塞进有界池，池满时新调用一样要排队，等于把老毛病搬个地方。
+        threading.Thread(target=dispatch_tool, args=(name, args, rid), daemon=True).start()
     elif method == 'ping':
         reply(rid, {})
     elif rid is None:

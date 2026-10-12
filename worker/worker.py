@@ -468,7 +468,202 @@ logger.addHandler(handler)
 
 app = FastAPI(title="Local Download Worker")
 
-def validate_public_url(url: str):
+
+# ---------------------------------------------------------------------------
+# Event-loop responsiveness probe (replaces a failed heartbeat)
+#
+# The symptom: external probes get connect=0-1 ms but no HTTP response for 1-10 s, on
+# every endpoint at once.  Two very different causes look identical from outside:
+#   (a) requests ARE reaching the app but the event loop is busy, so handling is
+#       delayed -- the delay is inside this process; or
+#   (b) responses ARE produced quickly but something below the app delays them
+#       (kernel, Tailscale userspace path) -- the delay is outside this process.
+#
+# A thread-based heartbeat could NOT answer this: CPython hands the GIL to a waking
+# thread within ~5 ms even while another thread spins, so a sleeping instrument never
+# notices the loop being busy (measured: a deliberate 4 s GIL-holding busy loop was
+# undetectable).  It was removed for that reason.
+#
+# What DOES separate (a) from (b): the moment the handler actually runs.  External
+# probes fire on a fixed cadence (the 2 s /health probe).  If the handler records the
+# gap since its own previous invocation, then
+#   * gap ~= the probe cadence      -> the loop was keeping up; a stall must be (b);
+#   * gap >> the probe cadence      -> the requests were queued unhandled for that
+#                                      long, which only happens inside the process.
+#
+# Cost: one monotonic clock read and a comparison per /health request, plus a log line
+# only when the gap is abnormal.  Nothing is written on the steady-state path.
+LOOP_STALL_MIN_SECONDS = 5.0
+STREAM_SLOW_ITER_SECONDS = 0.5      # per-1MiB overhead above this is abnormal at ~10 Mbps
+STREAM_SLOW_CLEANUP_SECONDS = 0.5   # aclose should be near-instant; this flags the pool teardown
+_last_health_at = None
+
+
+@app.get("/health")
+async def health():
+    global _last_health_at
+
+    now = time.monotonic()
+    if _last_health_at is not None:
+        gap = now - _last_health_at
+        if gap >= LOOP_STALL_MIN_SECONDS:
+            logger.warning(
+                "[LOOPSTALL] /health handled only after a %.2fs gap with no request handled "
+                "(previous /health %.2fs ago) - requests were queued unhandled",
+                gap,
+                gap,
+            )
+    _last_health_at = now
+
+    # How long THIS call took to execute is not visible from outside: a probe's
+    # timeout only tells us the total round trip.  Measuring it here separates
+    # "the loop was busy and the request waited" (gap large, work tiny) from
+    # "this handler itself is slow" (gap normal, work large).
+    t_work = time.monotonic()
+    body = {
+        "status": "ok",
+        "worker": "local-download-worker",
+    }
+    work = time.monotonic() - t_work
+    if work >= 0.05:
+        logger.warning("[HEALTH-SLOW] handler executed for %.3fs", work)
+
+    return body
+
+
+# ---------------------------------------------------------------------------
+# DNS off the event loop
+#
+# socket.getaddrinfo() is a BLOCKING call, and it used to run directly inside the
+# async /stream handler (validate_public_url).  Measured on a reference host:
+#
+#     <bucket>.s3.amazonaws.com    11040 ms   (first lookup, then 0 ms from cache)
+#     s3.amazonaws.com             11027 ms
+#     www.google.com               11027 ms
+#
+# while an unresolvable name failed in 1 ms.  The 11 s comes from name resolution
+# being attempted against a first-choice DNS server that black-holes queries: a
+# higher-priority network interface (metric 1, vs the physical NIC's 35) points the
+# resolver there, so Windows waits out that server before falling back to a working one.
+#
+# Those 11 s were the whole "tunnel instability" mystery.  A py-spy snapshot taken
+# while the worker was unresponsive showed every thread parked on:
+#
+#     getaddrinfo (socket.py:989)  <- blocking, event loop held
+#     validate_public_url (worker.py)  <- async handler, should never block
+#     stream (worker.py)
+#
+# With a single event loop that means every other request waits too: /health stalls,
+# the Linux-side watchdog's 6 s probe times out, and a perfectly healthy tunnel gets
+# declared DOWN and torn down (its death then leaves the CLOSE-WAIT listener behind
+# that makes the next bind fail).  It also explains why the freezes were ~11-13 s and
+# independent of download load, and why they followed chunk completions: a completion
+# makes the driver open new Range requests, and each new hostname needs a lookup.
+#
+# Two things are done here.  The lookup moves to a worker thread via asyncio.to_thread,
+# so the event loop stays free and the wait only delays the ONE request that needed the
+# name.  And successful lookups are cached, so with the few S3 hostnames this host
+# downloads, the 11 s is paid about once each instead of on every new stream.
+#
+# The network is deliberately NOT touched: the host's DNS configuration belongs to
+# other software, and repointing it could break that host's connectivity.
+# ---------------------------------------------------------------------------
+
+DNS_CACHE_TTL_SECONDS = 600.0   # how long a resolved hostname stays usable
+DNS_TIMEOUT_SECONDS = 20.0      # bound the thread so a stuck resolver cannot pile up
+_dns_cache = {}                 # hostname -> (expires_at_monotonic, addresses)
+_dns_inflight = {}              # hostname -> Future, so parallel requests share one lookup
+_dns_lock = None                # created lazily: binding a Lock to a loop is deprecated here
+
+
+def _dns_lookup_blocking(hostname, port):
+    """Runs in a worker thread.  The only blocking part is getaddrinfo itself."""
+    return socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+
+
+async def resolve_hostname(hostname, port):
+    """Resolve off the event loop, cached, and de-duplicated across parallel requests.
+
+    Raises socket.gaierror exactly like socket.getaddrinfo, so callers keep their
+    existing behaviour: a name only the proxy can resolve still falls through to it.
+    """
+    global _dns_lock
+
+    loop = asyncio.get_running_loop()
+    if _dns_lock is None:
+        _dns_lock = asyncio.Lock()
+
+    now = time.monotonic()
+    cached = _dns_cache.get(hostname)
+    if cached is not None:
+        if cached[0] > now:
+            return cached[1]
+        _dns_cache.pop(hostname, None)
+
+    async with _dns_lock:
+        # Re-check: another task may have filled the cache while we waited.
+        cached = _dns_cache.get(hostname)
+        if cached is not None and cached[0] > time.monotonic():
+            return cached[1]
+
+        # The downloader opens several parallel Range requests for the same URL, so
+        # without this every one of them would start its own lookup and they would all
+        # pay the full 11 s instead of sharing a single one.
+        inflight = _dns_inflight.get(hostname)
+        if inflight is None:
+            inflight = loop.create_future()
+            _dns_inflight[hostname] = inflight
+            owner = True
+        else:
+            owner = False
+
+    if not owner:
+        return await asyncio.shield(inflight)
+
+    def _absorb(fut):
+        # If nobody is left awaiting the shared future (every waiter cancelled, or the
+        # request was aborted), asyncio would otherwise log "Future exception was never
+        # retrieved" for the failure we are about to store.  Retrieving it here marks it
+        # handled; the real callers still get the exception from their own await.
+        if not fut.cancelled():
+            fut.exception()
+
+    started = time.monotonic()
+    try:
+        addresses = await asyncio.wait_for(
+            asyncio.to_thread(_dns_lookup_blocking, hostname, port),
+            timeout=DNS_TIMEOUT_SECONDS,
+        )
+        elapsed = time.monotonic() - started
+        _dns_cache[hostname] = (time.monotonic() + DNS_CACHE_TTL_SECONDS, addresses)
+        if elapsed >= 1.0:
+            # Worth a line: this is the delay that used to freeze the whole worker.
+            logger.info(
+                "[DNS] resolved host=%s in %.2fs (now cached %.0fs; the wait no longer "
+                "blocks the event loop)",
+                hostname,
+                elapsed,
+                DNS_CACHE_TTL_SECONDS,
+            )
+        inflight.add_done_callback(_absorb)
+        inflight.set_result(addresses)
+        return addresses
+    except asyncio.TimeoutError as exc:
+        inflight.add_done_callback(_absorb)
+        inflight.set_exception(exc)
+        raise socket.gaierror(
+            f"DNS lookup for {hostname} exceeded {DNS_TIMEOUT_SECONDS:.0f}s"
+        ) from exc
+    except BaseException as exc:  # includes gaierror; must reach every waiter
+        if not inflight.done():
+            inflight.add_done_callback(_absorb)
+            inflight.set_exception(exc)
+        raise
+    finally:
+        _dns_inflight.pop(hostname, None)
+
+
+async def validate_public_url(url: str):
     parsed = urlparse(url)
 
     if parsed.scheme not in ("http", "https"):
@@ -486,10 +681,11 @@ def validate_public_url(url: str):
     hostname = parsed.hostname
 
     try:
-        addresses = socket.getaddrinfo(
+        # await, not a bare call: see "DNS off the event loop" above.  Blocking here is
+        # what used to stall every other endpoint for ~11 s and get the tunnel killed.
+        addresses = await resolve_hostname(
             hostname,
             parsed.port or (443 if parsed.scheme == "https" else 80),
-            type=socket.SOCK_STREAM,
         )
     except socket.gaierror:
         # A name that only the proxy can resolve must still be able to go out
@@ -607,14 +803,6 @@ class DownloadRequest(BaseModel):
     output: str
 
 
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "worker": "local-download-worker",
-    }
-
-
 @app.get("/status")
 async def status():
     """What this PC is transferring right now.  Unauthenticated, like /health.
@@ -701,7 +889,7 @@ async def download(req: DownloadRequest, request: Request):
 
 @app.get("/stream")
 async def stream(request: Request, url: str):
-    validate_public_url(url)
+    await validate_public_url(url)
     headers = {}
 
     if "range" in request.headers:
@@ -787,15 +975,69 @@ async def stream(request: Request, url: str):
     async def iterator():
         bytes_sent = 0
 
+        # --- data-path instrumentation -------------------------------------
+        # The worker's event loop freezes for a consistent ~9-11 s on this PC and
+        # EVERY endpoint stalls with it, so the freeze is somewhere on the download
+        # data path -- but "somewhere" is not good enough to fix it.  These monotonic
+        # clocks split each iteration into its four phases so the next freeze names
+        # the operation responsible instead of leaving it to inference:
+        #   pull   = waiting for the next 1 MiB from the upstream (network; must not
+        #            block the loop, but a stuck socket or a blocking resolve shows here)
+        #   limit  = the global bandwidth limiter (asyncio.Lock + asyncio.sleep)
+        #   yield  = handing the chunk to the client; this is where the generator is
+        #            suspended while the response is written, so it includes flow control
+        #   rest   = bookkeeping, plus however long this task waited to be scheduled
+        #            again (that last part is the fingerprint of an event loop that is
+        #            occupied by SOMETHING ELSE -- it is unattributed time by design)
+        # `outside` is the kicker: it accumulates the time this iterator spent NOT
+        # running.  If the freeze is not inside any of the labelled phases, it has to
+        # show up there.
+        stats = {
+            "iters": 0, "pull": 0.0, "limit": 0.0, "yield": 0.0,
+            "rest": 0.0, "outside": 0.0, "slow": 0, "worst": 0.0,
+            "prev": None, "worst_phase": "",
+        }
+
+        def note(phase, secs):
+            stats[phase] += secs
+            if secs > stats["worst"]:
+                stats["worst"] = secs
+                stats["worst_phase"] = phase
+
         try:
             async for chunk in response.aiter_bytes(1024 * 1024):
+                t0 = time.monotonic()
+                if stats["prev"] is not None:
+                    stats["outside"] += max(0.0, t0 - stats["prev"])
+                stats["prev"] = t0
+                stats["iters"] += 1
+
                 await bandwidth_limiter.acquire(len(chunk))
+                t1 = time.monotonic()
+                note("limit", t1 - t0)
 
                 bytes_sent += len(chunk)
                 transfer_progress(snapshot, bytes_sent)
                 yield chunk
+                t2 = time.monotonic()
+                note("yield", t2 - t1)
+
+                stats["rest"] += time.monotonic() - t2
+                stats["prev"] = time.monotonic()
 
             elapsed = time.monotonic() - start_time
+
+            # Only speak up when the iteration was slow: at ~10 Mbps a 1 MiB chunk is
+            # ~1 s, so 0.5 s of overhead is abnormal and stands out in the log.
+            per_iter = (time.monotonic() - start_time) / max(stats["iters"], 1)
+            if stats["iters"] and per_iter > STREAM_SLOW_ITER_SECONDS:
+                logger.warning(
+                    "[STREAM-SLOW] total=%.2fs iters=%d avg_iter=%.3fs worst=%.3fs(%s) "
+                    "pull=%.2f limit=%.2f yield=%.2f rest=%.2f outside=%.2f bytes=%d",
+                    elapsed, stats["iters"], per_iter, stats["worst"], stats["worst_phase"],
+                    stats["pull"], stats["limit"], stats["yield"], stats["rest"],
+                    stats["outside"], bytes_sent,
+                )
 
             logger.info(
                 "STREAM complete host=%s status=%s bytes=%d elapsed=%.2fs route=%s",
@@ -824,9 +1066,20 @@ async def stream(request: Request, url: str):
             # Synchronous and first: a client aborting mid-stream is a normal
             # way for a transfer to end here, and /status must stop reporting
             # it even if the closes below are cancelled.
+            t_cleanup = time.monotonic()
             transfer_end(transfer_id)
             await response.aclose()
+            t_resp_closed = time.monotonic()
             await client.aclose()
+            cleanup = time.monotonic() - t_cleanup
+            if cleanup > STREAM_SLOW_CLEANUP_SECONDS:
+                logger.warning(
+                    "[STREAM-CLEANUP] aclose took %.2fs (response=%.2fs client=%.2fs) "
+                    "iters=%d bytes=%d worst_iter=%.3fs(%s) outside=%.2f",
+                    cleanup, t_resp_closed - t_cleanup, time.monotonic() - t_resp_closed,
+                    stats["iters"], bytes_sent, stats["worst"], stats["worst_phase"],
+                    stats["outside"],
+                )
 
     return StreamingResponse(
         iterator(),

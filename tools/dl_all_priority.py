@@ -63,9 +63,48 @@ HOLE_SCANNER  = CFG.get('tools.hole_scanner', '')
 RANGE_PATCHER = CFG.get('tools.range_patcher', '')
 HOLE_MARGIN   = 2097152
 STAGE_DIR         = CFG.get('paths.stage_dir', '')
-STAGE_HIGH_GB     = CFG.get_float('ops.stage_high_gb', 100.0)
-STAGE_LOW_GB      = CFG.get_float('ops.stage_low_gb', 60.0)
+# Watermarks for the staging pool.  They scale with the number of outlets rather
+# than being a fixed number: the pool holds transfers in flight, and one more
+# outlet means one more transfer's worth of window, not one more whole file.  The
+# cap keeps the volume bounded however many outlets show up.  Setting
+# stage_high_gb to a positive number pins the watermark and turns scaling off.
+STAGE_HIGH_CFG_GB = CFG.get_float('ops.stage_high_gb', 0.0)
+STAGE_LOW_CFG_GB  = CFG.get_float('ops.stage_low_gb', 0.0)
+STAGE_CAP_GB      = CFG.get_float('ops.stage_cap_gb', 500.0)
+STAGE_BASE_GB     = CFG.get_float('ops.stage_base_gb', 100.0)
+STAGE_PER_PORT_GB = CFG.get_float('ops.stage_per_port_gb', 80.0)
 STAGE_MAX_FILE_GB = CFG.get_float('ops.stage_max_file_gb', 90.0)
+
+def _ports_budget_count():
+    """How many outlets to size the watermark for: configured ones plus live ones.
+
+    Configured and not only-live on purpose.  Liveness flickers (a probe timeout, a
+    busy mount), and a watermark that follows it makes the pool appear to shrink and
+    grow at random -- the symptom reads as "the driver randomly stops taking work".
+    """
+    seen = set()
+    try:
+        import worker_pool as _wp
+        for p in (_wp.configured_ports() or ()):
+            seen.add(str(p))
+    except Exception:
+        pass
+    # This runs before the pool is built, so `_pool` is normally still None; the
+    # getattr is here so moving this block below pool construction stays correct.
+    for u in (getattr(globals().get('_pool'), 'alive', None) or ()):
+        seen.add(str(u).rstrip('/').rsplit(':', 1)[-1])
+    seen.discard('')
+    return max(1, len(seen))
+
+if STAGE_HIGH_CFG_GB > 0:                 # a positive number pins it
+    STAGE_GB_AUTO = False
+    _NPORTS = 0
+    STAGE_HIGH_GB = STAGE_HIGH_CFG_GB
+else:
+    STAGE_GB_AUTO = True
+    _NPORTS = _ports_budget_count()
+    STAGE_HIGH_GB = min(STAGE_CAP_GB, STAGE_BASE_GB + STAGE_PER_PORT_GB * _NPORTS)
+STAGE_LOW_GB = STAGE_LOW_CFG_GB if STAGE_LOW_CFG_GB > 0 else STAGE_HIGH_GB * 0.6
 STREAM_LOCAL      = os.environ.get('STREAM_LOCAL', '0') == '1'
 STREAM_CONNS      = int(os.environ.get('STREAM_CONNS', '4'))
 STREAM_CHUNK      = int(os.environ.get('STREAM_CHUNK_MB', '64')) * 1024 * 1024
@@ -85,6 +124,18 @@ if CFG.get_bool('ops.record_ledger', False):
         import verify_downloads as _ledger
     except Exception:
         _ledger = None
+
+# The staging ledger: a few small files written next to the staging pool, holding the
+# schedule and the progress of every transfer.  They exist so a remote reader can
+# answer "what is running and how far along" by opening a handful of files, instead
+# of walking a network mount -- a walk over a busy mount can take minutes, a single
+# read takes milliseconds.  Optional like the ledger above: no module, no feature,
+# transfers unaffected.
+sys.path.insert(0, HERE)
+try:
+    import ssd_ledger as _sl
+except Exception:
+    _sl = None
 
 # Roots the "already on disk?" search walks, and the subset of them that other
 # writers also touch (a file there is only trusted once its container trailer is
@@ -715,22 +766,52 @@ def _stage_supervise():
     except Exception:
         pass
 
+def _is_port_dir(name):
+    """Is this top-level directory an outlet rather than a window?  Outlet names are
+    numeric or "linux"; see ssd_ledger.window_dir."""
+    return name == 'linux' or name.isdigit()
+
 def _gc_windows(max_age_h=24):
+    """Remove window directories left behind by transfers that are long gone.
+
+    Windows live one level down, under their outlet's directory, so the listing walks
+    that far.  A window in use is kept fresh by the status thread touching it every
+    round, so age is a reliable signal here; the process check is a second guard for
+    the case where the driver's status thread is not running at all.
+
+    An outlet directory is a CONTAINER, never a candidate itself.  Treating it as one
+    deletes live work: its mtime only moves when a task directory appears or goes away,
+    so an outlet that has been running one long transfer for a day, with no other task
+    entering or leaving it, looks stale -- and removing it takes the window that is
+    being written right now with it, punch-hole and fsync being path-based.  The
+    candidates are the task directories inside an outlet, plus any old-style whole-file
+    cache directories still sitting at the top from before the layout changed.
+    """
     now = time.time()
+    cands = []
     try:
-        entries = [e for e in os.listdir(STAGE_DIR)
-                   if os.path.isdir(os.path.join(STAGE_DIR, e))]
+        top = [e for e in os.listdir(STAGE_DIR) if os.path.isdir(os.path.join(STAGE_DIR, e))]
     except Exception:
         return
-    if not entries:
+    for e in top:
+        p = os.path.join(STAGE_DIR, e)
+        if _is_port_dir(e):
+            try:
+                cands += [os.path.join(p, x) for x in os.listdir(p)
+                          if os.path.isdir(os.path.join(p, x))]
+            except OSError:
+                pass
+            continue
+        cands.append(p)
+    if not cands:
         return
     try:
         ps = subprocess.run(['pgrep', '-af', 'linux_downloader.py'],
                             capture_output=True, text=True).stdout or ''
     except Exception:
         return
-    for e in entries:
-        p = os.path.join(STAGE_DIR, e)
+    for p in cands:
+        e = os.path.basename(p)
         try:
             mt = os.path.getmtime(p)
             for f in os.listdir(p):
@@ -796,14 +877,21 @@ def _drop_stream_residue_for_old_path(final, quiet_s=120):
         except OSError as e:
             print(f"[stage] {name}: 删 {os.path.basename(p)} 失败: {e}", flush=True)
 
-def _run_stream(sp, final, url, md5=None, tag='driver:stream'):
-    _admit_stream(own_dir=os.path.join(STAGE_DIR, os.path.basename(final)))
+def _run_stream(sp, final, url, md5=None, tag='driver:stream', mk=None, port=None):
+    port = port or (_sl.LOCAL_PORT if _sl else 'local')
+    wroot = _sl.window_dir(port) if _sl else STAGE_DIR
+    name = os.path.basename(final)
+    _admit_stream(own_dir=os.path.join(wroot, name))
+    # Record the now-known name, url and output directory against the line.  The
+    # `worker` key is deliberately left alone -- the status snapshot reads it to tell
+    # which outlet a line belongs to.
+    _line_enrich(mk, name=name, url=url, outdir=os.path.dirname(final), md5=md5)
     cmd = ['python3', WIN_DOWNLOADER, url, '-o', final, '--direct', '--stream',
-           '--window-dir', STAGE_DIR, '--connections', str(STREAM_CONNS),
+           '--window-dir', wroot, '--connections', str(STREAM_CONNS),
            '--chunk-size', str(STREAM_CHUNK), '--window-max', str(STREAM_WINDOW)]
     if md5 and ';' not in md5:
         cmd += ['--md5', md5]
-    print(f"[stream] {sp}: 开下 → 窗口 {STAGE_DIR}（上限 {STREAM_WINDOW/2**30:.2f} GiB，"
+    print(f"[stream] {sp}: 开下 → 窗口 {wroot}（上限 {STREAM_WINDOW/2**30:.2f} GiB，"
           f"预留 {_stream_reserve_gb():.2f} GB）", flush=True)
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=None)
     if r.returncode != 0 or not os.path.exists(final):
@@ -847,7 +935,7 @@ def http_content_length(url, timeout=30):
         pass
     return None
 
-def run_one(task):
+def run_one(task, mk=None):
     sp, source, payload, outdir, platform = task
     try:
         os.makedirs(outdir, exist_ok=True)
@@ -869,7 +957,8 @@ def run_one(task):
             if STREAM_LOCAL and STAGE_DIR and _stream_eligible(final_path):
                 _e = verbatim_info.get(sp, {}) or {}
                 _md5 = _e.get('md5') or _e.get('md5sum')
-                r = _run_stream(sp, final_path, url, md5=_md5, tag='driver:stream-verbatim')
+                r = _run_stream(sp, final_path, url, md5=_md5, tag='driver:stream-verbatim',
+                                mk=mk, port=(_sl.LOCAL_PORT if _sl else 'local'))
                 if r[0]:
                     return r
                 if '已隔离' in (r[2] or '') or os.path.exists(final_path + '.download.json'):
@@ -920,7 +1009,8 @@ def run_one(task):
                         return _finish_ok("OK (卡洞 auto-repaired + verified)")
                     return (False, sp, f"卡洞 repair FAILED (no clean recheck): {os.path.basename(best_path)}")
             if _use_stream:
-                r = _run_stream(sp, _final, f"{S3_BASE}/{best}")
+                r = _run_stream(sp, _final, f"{S3_BASE}/{best}",
+                                mk=mk, port=(_sl.LOCAL_PORT if _sl else 'local'))
                 if r[0]:
                     return r
                 if '已隔离' in (r[2] or '') or os.path.exists(_final + '.download.json'):
@@ -1017,6 +1107,12 @@ def run_one_windows(task, worker, rec=None):
                 key = best
             url = f"{S3_BASE}/{key}"
             outpath = os.path.join(outdir, os.path.basename(key))
+        # The name and url are settled now, so hand them back to the line state.  The
+        # staging ledger and the status snapshot both read from there; the sooner this
+        # lands, the sooner a remote status shows the real file instead of a placeholder.
+        _line_enrich(rec.get('mk') if rec else None,
+                     name=os.path.basename(outpath), url=url,
+                     outdir=os.path.dirname(outpath), md5=md5)
         if os.path.exists(outpath + '.download.json'):
             pass
         elif key is not None and os.path.exists(outpath) and os.path.getsize(outpath) > 0:
@@ -1074,6 +1170,22 @@ def _line_mark(key, val=None):
         else:
             _line_state[key] = val
 
+def _line_enrich(mk, **kw):
+    """Add fields to one line's state without disturbing the others.
+
+    Used to hand back what only the downloading line knows once it has resolved it:
+    the final file name, its url, and the directory it lands in.  Both the staging
+    ledger and the status snapshot read from line state, so the earlier this lands
+    the sooner a remote `status` shows a real file name instead of a placeholder.
+    Must happen before the line is cleared at the end of its task.
+    """
+    if not mk:
+        return
+    with _lock:
+        cur = _line_state.get(mk)
+        if isinstance(cur, dict):
+            cur.update({k: v for k, v in kw.items() if v not in (None, '')})
+
 def _event(kind, sp, backend, msg=''):
     with _lock:
         _events.append({'ts': time.strftime('%Y-%m-%d %H:%M:%S'), 'kind': kind,
@@ -1113,6 +1225,336 @@ def _status_snapshot():
                          'stream_local': STREAM_LOCAL,
                          'local_lines': globals().get('NWORKERS')}}
 
+# ---- staging ledger -------------------------------------------------------
+# One small file per outlet plus one global file, rewritten atomically every status
+# round.  The shape is set by the reader, not the writer: a remote side answers "what
+# is queued, what is running, how far along" by opening a handful of files, which is
+# milliseconds, instead of walking a network mount, which on a busy mount is minutes.
+# A row appears when a task is dispatched and goes away ten days after it ends.
+_LEDGER_QUEUE_HEAD = int(os.environ.get('SSD_LEDGER_QUEUE_HEAD', '12'))
+_ledger_outcomes = []      # terminal rows pushed by the lines as they end
+_LEDGER_STICKY = ('requester', 'url', 'outdir', 'item', 'platform', 'size', 'md5')
+_LEDGER_TERMINAL = ('done', 'fail', 'error')   # beats a "running" row for the same key (see _ssd_rows)
+
+
+def _ledger_port(ln):
+    """Line state -> outlet name ('local' for the local line, else the port number).
+
+    None when it cannot be told; that row is left out rather than filed under a
+    guessed outlet.
+    """
+    if not isinstance(ln, dict):
+        return None
+    if ln.get('worker'):
+        return str(ln['worker'])
+    b = str(ln.get('backend') or '')
+    if b.startswith('win:'):
+        return b.split(':', 1)[1] or None
+    if b == 'local':
+        return (_sl.LOCAL_PORT if _sl else 'local')
+    return None
+
+
+def _task_names(t):
+    """Task tuple -> (file name, url, output dir), from strings only.
+
+    This runs on the status thread while it holds _lock, so it must not make any call
+    that can block -- a listing or a directory walk here stalls the whole status loop,
+    and with it the control-file readback that operators rely on.  Where the name is
+    not knowable without a listing, it stays empty and the line fills it in later.
+    """
+    try:
+        item, source, payload, outdir, platform = t
+    except Exception:
+        return '', '', ''
+    name, url = '', ''
+    if source == 'SOURCE_B':
+        url = payload or ''
+        name = os.path.basename(url)
+    else:
+        try:
+            _prefix, _build, key = payload
+            if platform and key:
+                name = os.path.basename(key)
+        except Exception:
+            pass
+    return name, url, (outdir or '')
+
+
+def _window_used(port, name):
+    """Bytes of this transfer still sitting in the staging window.
+
+    st_blocks, not apparent size: a streaming window is sparse -- written high, then
+    punched -- so its apparent size climbs toward the whole file while it holds almost
+    nothing.  Touching the directory mtime doubles as a keep-alive for the window
+    reaper, which would otherwise be free to collect a directory a slow transfer is
+    still using.
+    """
+    if not (_sl and STAGE_DIR and name):
+        return 0
+    w = os.path.join(_sl.window_dir(port), name, name)
+    try:
+        st = os.stat(w)
+        os.utime(os.path.dirname(w), None)
+        return int(st.st_blocks) * 512
+    except OSError:
+        return 0
+
+
+def _progress_of(outpath):
+    """(done, total, note) from the downloader's own sidecar: one open, no walk.
+
+    For a streamed transfer the honest number is `durable_bytes`, the fsynced
+    watermark -- bytes written into the window but not yet across are excluded, and
+    reported separately as the window's block count.  A sidecar in some other format
+    is reported as unreadable rather than guessed at: an unknown progress shown as a
+    number reads as fact.
+    """
+    if not outpath:
+        return 0, 0, 'no-path'
+    try:
+        with open(outpath + '.download.json', encoding='utf-8') as f:
+            m = json.load(f)
+    except FileNotFoundError:
+        return 0, 0, 'no-sidecar'
+    except (OSError, ValueError) as e:
+        return 0, 0, 'err:' + type(e).__name__
+    try:
+        total = int(m.get('size') or 0)
+        if m.get('mode') == 'stream':
+            # Independent commit (urgent lane) prefers done_bytes: out-of-order landing
+            # leaves durable_bytes as the prefix up to the first gap, reading 0 while the
+            # frontier block is stuck.  done_bytes = the sum of fsynced chunk lengths;
+            # older sidecars lack the key and fall back to durable_bytes.
+            done = int(m.get('done_bytes') if m.get('done_bytes') is not None
+                       else (m.get('durable_bytes') or 0))
+        elif m.get('chunk_size') and m.get('completed_chunks') is not None:
+            done = len(m.get('completed_chunks') or []) * int(m['chunk_size'])
+        else:
+            return 0, total, 'no-metric'
+    except (TypeError, ValueError):
+        return 0, 0, 'bad-meta'
+    return max(0, done), max(0, total), ''
+
+
+def _ledger_note(port, name, **kw):
+    """Queue one terminal row (done or failed); the next round writes it out.
+
+    Only the last 40 are kept: a terminal row lives on in the file once written, so
+    this is a hand-off, not a second copy of the ledger in memory.
+    """
+    if not (_sl and port and name):
+        return
+    row = {'port': str(port), 'name': str(name)}
+    row.update({k: v for k, v in kw.items() if v is not None})
+    with _lock:
+        _ledger_outcomes.append(row)
+        del _ledger_outcomes[:-40]
+
+
+def _ledger_recent(port, name, limit=400):
+    """Pull this row's existing fields back out of the file on disk.
+
+    Fields like the requester and the size arrive progressively, so a later round must
+    not blank out what an earlier one established.  Reads a small file; if it cannot be
+    read, this row simply starts over.  The 400-row cap keeps a corrupted file from
+    stalling the status thread.
+    """
+    if not _sl:
+        return {}
+    try:
+        for r in _sl.read_all(ttl_days=None)[:limit]:
+            if str(r.get('port')) == str(port) and r.get('name') == name:
+                return {k: r.get(k) for k in _LEDGER_STICKY if r.get(k)}
+    except Exception:
+        pass
+    return {}
+
+
+def _who_text(o):
+    """Requester details -> one short line.  Absent detail stays absent: this reports
+    what the submission carried, it does not infer an identity."""
+    if not isinstance(o, dict) or not o:
+        return ''
+    bits = [str(x) for x in (o.get('model'), o.get('harness')) if x]
+    s = '/'.join(bits)
+    if o.get('session_id'):
+        s = (s + ' ' if s else '') + str(o['session_id'])[:12]
+    if o.get('rid'):
+        s = (s + ' ' if s else '') + '#' + str(o['rid'])[:8]
+    return s
+
+
+def _requester_of(sp, platform):
+    """Who asked for this (item, platform).  Read before the task is reported: the
+    origin is consumed at completion and deliberately not inherited by later tasks."""
+    try:
+        return _who_text(_pending_origin.get((sp, platform)) or {})
+    except Exception:
+        return ''
+
+
+def _line_finish(mk, ok, msg=''):
+    """Turn a line's last known state into a terminal ledger row.
+
+    Must run before `_line_mark(mk, None)` -- clearing the line loses its name, url and
+    output directory -- and before the completion report, which consumes the origin.
+    A successful row carries no size: the downloader removes its sidecar on landing,
+    and the ledger fills the size in for terminal rows.
+    """
+    if not _sl:
+        return
+    with _lock:
+        ln = dict(_line_state.get(mk) or {})
+    port = _ledger_port(ln)
+    name = ln.get('name') or ''
+    if not port:
+        return
+    if not name:
+        # It ended before any file name was resolved (typically: nothing usable
+        # upstream, decided without a listing).  Fall back to the task name so the
+        # failure is visible at all -- a row that never appears is indistinguishable
+        # from a task that was never tried.
+        name = (ln.get('item') or '').strip()
+        if not name:
+            return
+        name += ' (unresolved)'
+    _ledger_note(port, name, state=('done' if ok else 'fail'),
+                 item=ln.get('item') or '', platform=ln.get('platform') or '',
+                 url=ln.get('url') or '', outdir=ln.get('outdir') or '',
+                 started=ln.get('started') or '',
+                 requester=ln.get('requester') or _requester_of(ln.get('item'), ln.get('platform')),
+                 note=('' if ok else (msg or '')[:160]))
+
+
+def _ssd_rows():
+    """This round's task rows: the in-flight lines plus whatever just ended.
+
+    Rows are keyed by (outlet, name).  The queue head is deliberately not here -- see
+    `_ssd_queue_meta`.
+    """
+    if not _sl:
+        return []
+    rows, idx = [], {}
+
+    def _push(row):
+        # One row per (outlet, name), but a single round can see the same task twice: a
+        # line keeps its state until the next `_line_mark`, so between finishing and
+        # clearing, the status thread can see both the "running" row and the terminal
+        # one.  The terminal row must win -- it is delivered exactly once (the outcome
+        # buffer is drained every round), so losing the race to de-duplication loses the
+        # result for good, and a visible result is half of what this ledger is for.
+        k = (str(row.get('port')), row.get('name'))
+        if not row.get('port') or not row.get('name'):
+            return
+        base = _ledger_recent(*k)
+        base.update({kk: vv for kk, vv in row.items() if vv not in (None, '')})
+        i = idx.get(k)
+        if i is None:
+            idx[k] = len(rows)
+            rows.append(base)
+            return
+        if rows[i].get('state') in _LEDGER_TERMINAL or base.get('state') not in _LEDGER_TERMINAL:
+            return          # a terminal row is already in, or this one is not terminal either
+        rows[i] = base
+
+    with _lock:
+        lines = [dict(v) for v in _line_state.values()]
+        outs = [dict(r) for r in _ledger_outcomes]
+        _ledger_outcomes.clear()
+
+    for ln in lines:
+        port = _ledger_port(ln)
+        if not port:
+            continue
+        # The name the line resolved wins over anything re-derived here: for an
+        # object-store task the tuple carries no key until a listing is done, so
+        # deriving from it alone leaves the task nameless for its whole life and no
+        # running row ever appears.  The line reports the name the moment it has it.
+        name = ln.get('name') or ''
+        url = ln.get('url') or ''
+        outdir = ln.get('outdir') or ''
+        if not name:
+            continue                    # still unknown; the line fills it in next round
+        final = os.path.join(outdir, name)
+        done, size, note = _progress_of(final) if outdir else (0, 0, 'no-path')
+        if note in ('no-sidecar', 'no-path'):
+            note = ''                   # just started, or a direct write: both normal
+        elif not done and not size:
+            # A sidecar we cannot read means the progress is genuinely unknown.  Say so
+            # instead of showing a number that looks like it is running.
+            note = 'progress unreadable (' + note + ')'
+        row = {'port': port, 'name': name,
+               'state': ('error' if note.startswith(('progress unreadable', 'err:', 'bad-meta'))
+                         else 'running'),
+               'item': ln.get('item') or '', 'platform': ln.get('platform') or '',
+               'url': ln.get('url') or '', 'outdir': outdir, 'started': ln.get('started') or '',
+               'requester': ln.get('requester') or _requester_of(ln.get('item'), ln.get('platform')),
+               'done': done, 'size': size, 'win_used': _window_used(port, name), 'drv': DRIVER_NAME}
+        if note:
+            row['note'] = note
+        _push(row)
+
+    for r in outs:
+        r.setdefault('drv', DRIVER_NAME)
+        _push(r)
+    return rows
+
+
+def _ssd_queue_meta(limit_head=None):
+    """The queue head, as meta on the global file.
+
+    These are not rows: they belong to no outlet yet and have no end, so a row would
+    never expire and the file would silt up with tasks that look perpetually queued.
+    Meta is rewritten wholesale each round, so it only ever shows what is queued now.
+    Sizes are left blank on purpose -- finding them would mean a network call, which
+    does not belong on the status thread.  They fill in once a task starts running.
+    """
+    if not _sl:
+        return []
+    head = _LEDGER_QUEUE_HEAD if limit_head is None else limit_head
+    out = []
+    try:
+        with _lock:
+            queued = list(_pending[:head])
+    except Exception:
+        return []
+    for t in queued:
+        try:
+            name, url, outdir = _task_names(t)
+            key = (t[0], t[4])
+            out.append({'name': name or '(pending)', 'item': t[0] or '', 'platform': t[4] or '',
+                        'url': url, 'outdir': outdir,
+                        'requester': _who_text(_pending_origin.get(key) or {})})
+        except Exception:
+            continue
+    return out
+
+
+def _materialize_ssd_ledger(quiet=True):
+    """Write the current picture to the staging pool (status thread, every round).
+
+    Same discipline as the status snapshot: never raises, never blocks the transfer
+    path, never makes a network call, and reports a failure in one log line.  It runs
+    on the status thread, so the worst case is one late snapshot -- never a stalled
+    transfer.
+    """
+    if not (_sl and STAGE_DIR):
+        return
+    try:
+        rows = _ssd_rows()
+        alive = {(str(r.get('port')), r.get('name')) for r in rows if r.get('state') == 'running'}
+        _sl.write(rows, meta={'queue': _ssd_queue_meta(),
+                              'stage_high_gb': round(STAGE_HIGH_GB, 1),
+                              'stage_gb': round(_stage_used_gb(), 2) if STAGE_DIR else None,
+                              'np_ports': _NPORTS, 'gb_auto': STAGE_GB_AUTO},
+                  alive=alive, drv=DRIVER_NAME)
+    except Exception as e:
+        if not quiet:
+            print(f"[ledger] write failed (transfers unaffected): {type(e).__name__}: {str(e)[:120]}",
+                  flush=True)
+
+
 def _write_status_snapshot():
     try:
         d = os.path.dirname(STATUS_FILE)
@@ -1132,6 +1574,7 @@ def _status_writer():
         _write_status_snapshot()
         _ranks_save()
         _queue_save()
+        _materialize_ssd_ledger()   # staging ledger: one read answers a remote status
         time.sleep(STATUS_INTERVAL)
 
 def _take(skip=None):
@@ -1757,7 +2200,8 @@ def local_loop():
         _line_mark(_lk, {'backend': 'local', 'item': t[0], 'platform': t[4],
                          'task': t,
                          'started': time.strftime('%Y-%m-%d %H:%M:%S')})
-        res = run_one(t)
+        res = run_one(t, mk=_lk)
+        _line_finish(_lk, res[0], res[2])   # terminal row, before the line state is cleared
         _line_mark(_lk, None)
         if not res[0]:
             msg = res[2] or ''
@@ -1818,6 +2262,7 @@ def windows_loop(rec=None):
             print(f"[{_wport(w)}] 接任务: {t[0]} ({t[4]})", flush=True)
         rec['task'] = t
         _lk = 'win-%d' % (rec['seq'] or threading.get_ident())
+        rec['mk'] = _lk          # for run_one_windows to report the resolved file name
         _line_mark(_lk, {'backend': f'win:{_wport(w)}', 'worker': _wport(w), 'item': t[0],
                          'platform': t[4], 'task': t,
                          'started': time.strftime('%Y-%m-%d %H:%M:%S')})
@@ -1829,6 +2274,7 @@ def windows_loop(rec=None):
             rec['task'] = None
             rec['proc'] = None
             rec['phase'] = None
+        _line_finish(_lk, res[0], res[2])   # terminal row, before the line state is cleared
         _line_mark(_lk, None)
         if rec['retire'].is_set():
             if not res[0]:

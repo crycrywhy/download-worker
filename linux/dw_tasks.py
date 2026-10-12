@@ -6,6 +6,18 @@
 
 数据来源
 --------
+0. **预计算快照**（可选；配了 `cache_path` 才启用）—— 就是下面 1–3 全部算完之后的那一帧，
+   存在**本地快盘**上的一个文件里（`{written_epoch, written, frame}`）。命中且新鲜就直接回放，
+   **一次网络挂载都不碰**。
+
+   为什么要有这一层：一帧的代价几乎全在「在下」那一列 —— 每条都要进目标目录扫 sidecar
+   （`glob` + 逐个 `stat`），一帧 200+ 次 stat。挂载病态时实测 **32.9 s（其中 stat 独占 33.1 s，
+   CPU 合计 0.23 s）**，而远端 `status` 的 ssh 段上限只有 60 s：读得出也等不起。
+   把整帧挪到快盘上算一次，谁来读都是毫秒级。
+
+   本脚本对快照**只读**：它由另一侧的常驻程序定期烤（谁烤、多久烤一次是那边的事）。
+   快照过期或坏掉就退回现算，绝不会拿一份馊的顶上。
+
 1. **下载台账 CSV**（`--status-csv`，不给就按 `--csv-candidates` 自动探测）
    一行一个目标文件，约定列：`name,key,group,tier,status,path,size_gb,updated,notes`
    -> 状态计数、当前在下（`DOWNLOADING` / `REPAIRING`）的任务、最近完成。
@@ -37,19 +49,30 @@
 
 **本机的具体路径都不写在这个文件里**（它是公开的），一律放配置文件
 （`~/.config/download-worker/dw_tasks.json`，可用环境变量 `DW_TASKS_CONFIG` 换位置）：
-`status_csv_candidates`（主台账候选路径）、`extra_ledgers`（别的 driver 的台账）、`main_tz_h`。
+`status_csv_candidates`（主台账候选路径）、`extra_ledgers`（别的 driver 的台账）、`main_tz_h`、
+`cache_path` / `cache_max_age_s`（预计算快照的位置与保质期；不配 = 不启用这一层）、
+`ledger_path`（**中转盘上的下载台账**：在下的任务先问它，命中就一次挂载都不碰）、
+`scan_budget_s`（兜底扫目录的时间预算；到点就跳过剩余扫描，宁可标 skipped 也不拖死）。
 文件不存在就用中性默认，功能照常、只是少几路台账。
 
 用法
 ----
     python3 dw_tasks.py --json            # 一次性快照（download-worker status 用）
     python3 dw_tasks.py --watch 2         # 每 2 秒输出一行 JSON（download-worker process 用）
+    python3 dw_tasks.py --no-cache        # 忽略快照，强制现算（排查「快照是不是馊了」用）
     python3 dw_tasks.py --text            # 人看的表格（在 Linux 上直接跑）
     python3 dw_tasks.py --limit 5         # 「最近完成」显示几条（默认 5）
     python3 dw_tasks.py --channel <口>    # 只看这个通道口（某台 PC 的隧道口）在下的任务
 
 `--watch` 是 **JSONL**（一行一个对象、写完即 flush），断了管道（Ctrl+C / ssh 断开）就退出。
 速度（`speed_bps`）只在 `--watch` 里有：靠相邻两次采样的差值算，一次性快照给不出速度。
+
+**JSON 一律 ASCII 上线**（`ensure_ascii=True`，别改回 False）：这份输出是走 ssh 送到
+Windows 控制台的，那一边按**本地代码页**解码。raw 非 ASCII 会被拆坏 —— 实测中文字节的
+尾字节会**把紧随其后的引号一起吃掉**，于是 JSON 结构破损、调用方只看到"取不到 Linux 侧任务"
+（备注里一个奇数长度的中文串就足以触发）。转义成 `\\uXXXX` 后线路上**全是 ASCII**，
+任何代码页解出来都一样，解析端（ConvertFrom-Json / json.loads）会还原成正确中文。
+`--text` 是给人看的、不走这条路，保持中文原文。
 """
 import argparse
 import calendar
@@ -70,12 +93,18 @@ SCHEMA = 1
 #   status_csv_candidates : [路径, ...]     主台账 CSV 候选（按顺序取第一个存在的）
 #   main_tz_h             : 8               主台账时间列的时区偏移（相对 UTC）
 #   extra_ledgers         : [{glob, owner, kind, tz_h}, ...]   别的 driver 的台账
+#   cache_path            : 预计算快照的文件（本地快盘上）；配了才启用，缺省不用
+#   cache_max_age_s       : 600             快照多久算过期（过期就现算，不拿馊的顶上）
+#   ledger_path           : 中转台账（快盘上）；有它的行不再去扫网络挂载
+#   scan_budget_s         : 0               兜底扫目录的时间预算（秒）；0 = 不限
 DEFAULT_CONFIG_PATH = "~/.config/download-worker/dw_tasks.json"
 
 
 def load_config(path=None):
     """读配置文件；没有 / 读不动就返回中性默认（功能照常，只是少几路台账）。"""
-    cfg = {"status_csv_candidates": None, "main_tz_h": None, "extra_ledgers": None}
+    cfg = {"status_csv_candidates": None, "main_tz_h": None, "extra_ledgers": None,
+           "cache_path": None, "cache_max_age_s": None,
+           "ledger_path": None, "scan_budget_s": None}
     path = path or os.environ.get("DW_TASKS_CONFIG") or DEFAULT_CONFIG_PATH
     try:
         with open(os.path.expanduser(path), encoding="utf-8") as fh:
@@ -133,6 +162,20 @@ for _spec in (CONFIG["extra_ledgers"] or []):
 # 主台账时间列的时区偏移（配置文件可覆盖）
 MAIN_TZ_H = 8 if CONFIG["main_tz_h"] is None else CONFIG["main_tz_h"]
 
+# 预计算快照：空串 = 不启用（老行为，一帧全现算）。
+# 保质期给得比「烤的快照间隔」宽（烤 3 分钟一次、这里 10 分钟）—— 烤的那头偶尔打个盹，
+# 读的人不该立刻掉回 30 s 的现算；真过期了就现算，宁可慢也不馊。
+CACHE_PATH = (CONFIG["cache_path"] or "").strip()
+CACHE_MAX_AGE_S = 600 if CONFIG["cache_max_age_s"] is None else float(CONFIG["cache_max_age_s"])
+
+# 中转台账（驱动器写、放本地快盘上的 JSONL：首行 meta，其后一行一个任务）。有它的行
+# **不再扫目标目录** —— 那才是这一帧真正贵的地方（目标目录在网络挂载上，一次 200+ stat，
+# 实测单次 stat 0.16 s）。空串 = 不启用（老行为：每条都自己去扫）。
+LEDGER_PATH = (CONFIG["ledger_path"] or "").strip()
+# 兜底扫描的时间预算（秒）：没有台账命中的行仍要扫目录，NFS 病态时一条就 1 s+。给个上限，
+# 超预算的行就不扫了（照常出现在列表里，只是没有当场测出来的百分比）。0 = 不限（老行为）。
+SCAN_BUDGET_S = 0.0 if CONFIG["scan_budget_s"] is None else float(CONFIG["scan_budget_s"])
+
 # 显示口径：一律 UTC+8（和主台账、和给用户的所有报告一致）
 DISPLAY_TZ = timezone(timedelta(hours=8))
 
@@ -147,6 +190,10 @@ EXTRA_STATES = {
 
 # 扫目录找「在写文件」时要跳过的后缀（sidecar / aria2 痕迹自己不是下载目标）
 SKIP_SUFFIXES = (".download.json", ".aria2", ".verified.json", ".aria2__temp")
+
+# 中转台账里**还在跑、却没有任何一行代表它**的件，补出来的行在 note 打这个记号。
+# 措辞与管家端同一份实现保持一致，两侧读到的帧才是同一种说法。
+LIVE_NOTE = "驱动在跑(台账补行)"
 
 
 def now_text():
@@ -276,8 +323,11 @@ def newest_file_age(directory):
 
 
 def activity_age(entry):
-    """这条最近一次「动过」是多久以前（秒）；三路都没有就给一个很大的数（排最后）。"""
-    ages = [entry.get(k) for k in ("sidecar_age_s", "mtime_age_s", "updated_age_s")]
+    """这条最近一次「动过」是多久以前（秒）；几路都没有就给一个很大的数（排最后）。
+
+    `ledger_age_s`：进度是从中转台账取的（那条线此刻真在写它）—— 台账刚写 = 这条活着。
+    """
+    ages = [entry.get(k) for k in ("sidecar_age_s", "mtime_age_s", "ledger_age_s", "updated_age_s")]
     ages = [age for age in ages if age is not None]
     return min(ages) if ages else 10 ** 9
 
@@ -399,13 +449,92 @@ def allocated_bytes(path):
     return getattr(st, "st_blocks", 0) * 512
 
 
-def progress_of(row):
+def load_ledger(path):
+    """读中转台账（JSONL），返回 ({目标目录: [进度信息, ...]}, 台账年龄秒)。
+
+    只取 `state == "running"` 的行：终态行里的 `pct` 是「结束时下到哪」，混进来会把
+    「已经完成的」显示成「正在下」。读不动 / 没配就返回 `({}, None)`，退回挨个扫目录的老路
+    —— 慢，但不丢信息。
+
+    **值一律是列表**：一个目标目录下**可能同时有多条在跑的** —— 同物种并发两份是常态，
+    而台账行是**逐文件**的。给「一个物种一行」的台账行找进度时取第一条；**剩下的那条由
+    `live_entries()` 补成独立的行**，否则它在帧里根本没有行（用户报的「在下载不显示」
+    「某个口又显示无下载任务」就是这里漏的）。
+
+    年龄按**文件 mtime** 算：台账由驱动侧每轮原子重写（tmp + rename），mtime 就是它
+    最后一次现身的时间；这个数直接当「这条此刻真在写」的活性信号用。
+    """
+    path = os.path.expanduser(path)
+    try:
+        age = max(0.0, time.time() - os.path.getmtime(path))
+    except OSError:
+        return {}, None
+    out = {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(row, dict) or row.get("state") != "running":
+                    continue
+                target = row.get("outdir")
+                size = row.get("size") or 0
+                done = row.get("done") or 0
+                if not target or not size:
+                    continue
+                out.setdefault(target, []).append({
+                    # 夹住：块粒度进位会让 `done` 略微超过声明的 size（最后一块不满也按整块算），
+                    # 不夹就会显示成「100.1%」这种没意义的数。
+                    "percent": round(min(100.0, 100.0 * done / size), 2),
+                    "bytes_done": done,
+                    "bytes_total": size,
+                    "source": "ledger",
+                    "port": str(row.get("port") or ""),
+                    "file": row.get("name") or "",
+                    "item": str(row.get("item") or ""),     # 目标名：补行时不必再从路径反推
+                })
+    except OSError:
+        return {}, None
+    return out, age
+
+
+def progress_of(row, ledger=None, ledger_age=None, deadline=None):
     """算一条在下任务的进度。返回 (dict, sidecar 路径)。
 
-    优先 sidecar（精确到块），退回已分配块数；两者都拿不到就给 None。
+    顺序：**中转台账 → sidecar → 已分配块数**。
+
+    台账那一支是唯一**不碰网络挂载**的 —— 目标目录在挂载上，连 `isdir` 都是一次
+    0.16 s 的 stat，一条就能顶掉整帧的预算。所以命中台账就直接返回，连目录存在与否都不问
+    （此刻真正在写的其实是中转窗口，那个目录在本地盘上）。
+
+    后两支要扫目录，受 `deadline` 约束：超预算就不扫了，行照常出现在列表里，
+    只是没有当场测出来的百分比（`progress_source = "skipped"`）。
     """
     directory = pick(row, "path")
-    if not directory or not os.path.isdir(directory):
+    if not directory:
+        return None, None
+
+    hits = (ledger or {}).get(directory)
+    if hits:
+        # 同目录并发两份时这里只认领第一条；**第二条不丢** —— snapshot() 末尾用
+        # live_entries() 把它补成独立的行（少了那一步，它在帧里就是隐形的）。
+        info = dict(hits[0])
+        info["sidecar"] = ""
+        info["sidecar_age_s"] = None
+        info["mtime_age_s"] = None
+        info["ledger_age_s"] = ledger_age
+        return info, None
+
+    if deadline is not None and time.time() > deadline:
+        return {"progress_source": "skipped", "sidecar": "",
+                "sidecar_age_s": None, "mtime_age_s": None}, None
+
+    if not os.path.isdir(directory):
         return None, None
 
     sidecar, meta, age = find_active_sidecar(directory)
@@ -419,7 +548,11 @@ def progress_of(row):
         chunk = meta.get("chunk_size") or 0
         done = meta.get("completed_chunks") or []
         if size > 0:
-            bytes_done = min(len(done) * chunk, size) if chunk else 0
+            # 独立提交（急件线，chunk_commit=independent）sidecar 直接给了 done_bytes
+            # （已 fsync 的块长度之和）⇒ 用它，末块不满时比 len×chunk 准。
+            # 老 sidecar 没有这个键，照旧按块数乘。
+            bytes_done = (meta.get("done_bytes") if meta.get("done_bytes") is not None
+                          else (min(len(done) * chunk, size) if chunk else 0))
             info.update({
                 "percent": round(100.0 * bytes_done / size, 2),
                 "bytes_done": bytes_done,
@@ -465,9 +598,151 @@ def progress_of(row):
     return info, sidecar
 
 
+def active_key(entry):
+    """一帧里「同一条在下任务」的键：目标名 + 目标目录 + **件名**。
+
+    **件名不能省**：同一个目标、同一个目录下可以并发两份，只按「目标名 + 目录」当键，
+    两条会共用一份速度基线、续帧时还会互相覆盖（补 `live_entries()` 时一并修）。
+    """
+    return "|".join((entry.get("name", ""), entry.get("path", ""), entry.get("file", "")))
+
+
+def live_entries(ledger, ledger_age, channels, by_name, seen):
+    """中转台账里**还在跑、却没有任何一行代表它**的件 → 补成帧里独立的 entry。
+
+    为什么必须补：台账 CSV 是**一个目标一行**、`progress_of()` 每个目录也只认领一条 ——
+    同一个目录**并发两份**时，**第二条在帧里完全没有行**；不光看不见，按口过滤
+    （`--channel`，对端 `status` 就是这么读的）时它还会被整条丢掉 ⇒ 一个正在以几 MiB/s
+    下载的口显示成「在下 0 个 / 此刻没有在下的任务」。
+
+    台账行是**逐文件**的事实，由驱动侧每轮重写、幽灵行另有存活清理兜底，拿它补齐最省事：
+    不碰网络挂载、不另探活、也不用猜。`seen` = 上面已认领的「目标全路径」集合，
+    命中即跳过 —— **绝不与既有行重复**。
+
+    口：优先按 `/proc` 的活体线认（那是「此刻真在写」），认不出才退回台账自己记的口。
+    """
+    out = []
+    for folder, infos in sorted((ledger or {}).items()):
+        for info in infos:
+            name = info.get("file") or ""
+            if not name:
+                continue
+            target = os.path.normpath(os.path.join(folder, name))
+            if target in seen:
+                continue
+            seen.add(target)
+            label = info.get("item") or name_from_out(target) or name
+            entry = {
+                "name": label,
+                "key": "",
+                "status": "DOWNLOADING",
+                "path": folder,
+                "file": name,
+                "size_gb": ("%.3f" % (info["bytes_total"] / (1024 ** 3))
+                            if info.get("bytes_total") else ""),
+                "updated": "",
+                "note": LIVE_NOTE,
+                "channel": channels.get(target) or by_name.get(name) or (info.get("port") or ""),
+                # 台账里还是 running ⇒ 它此刻在跑（幽灵行已由驱动侧清理），活性不靠 mtime 猜
+                "live": True,
+                "source": "ledger-live",                        # 与 progress_source 区分：这条是补的
+                "progress_source": info.get("source") or "ledger",
+                "ledger_age_s": int(ledger_age) if ledger_age is not None else None,
+            }
+            for field in ("percent", "bytes_done", "bytes_total"):
+                if info.get(field) is not None:
+                    entry[field] = info[field]
+            out.append(entry)
+    return out
+
+
 def load_rows(csv_path):
     with open(csv_path, newline="", encoding="utf-8-sig") as handle:
         return list(csv.DictReader(handle))
+
+
+def load_cache(path, max_age_s):
+    """读预计算快照，返回 (帧, 年龄秒, 写入时刻)；没有 / 过期 / 坏了都返回 (None, None, None)。
+
+    年龄按**写它的那一刻**算（`written_epoch`，由烤的那侧写进来），不看文件 mtime ——
+    快照被搬运或复制过一次，mtime 就变成搬运时间，用它判会把一份隔夜的数据当成刚出炉的。
+    """
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError):
+        return None, None, None
+    if not isinstance(raw, dict):
+        return None, None, None
+    frame, written = raw.get("frame"), raw.get("written_epoch")
+    if not isinstance(frame, dict) or not frame.get("ok"):
+        return None, None, None
+    if not isinstance(written, (int, float)):
+        return None, None, None
+    age = max(0.0, time.time() - written)
+    if max_age_s and age > max_age_s:
+        return None, None, None
+    return frame, age, float(written)
+
+
+def apply_view(frame, channel, limit):
+    """把一帧裁成调用方要的口径：通道过滤 + 「最近完成」条数。
+
+    快照存的是**全量**帧（谁读都得能用），所以回放时要按调用方的参数再裁一次。口径与
+    snapshot() 末尾那段一致：`active_total` / `active_live_total` 保持全量（它们是「全局」
+    的注脚，跟着裁就等于报错数），只裁 `active` 与 `recent`。
+    """
+    active = list(frame.get("active") or [])
+    if channel:
+        active = [e for e in active if (e or {}).get("channel") == channel]
+    frame["active"] = active
+    frame["active_live"] = sum(1 for e in active if (e or {}).get("live"))
+    frame["channel"] = channel
+    recent = list(frame.get("recent") or [])
+    frame["recent"] = recent[:limit] if limit and limit > 0 else recent
+    return frame
+
+
+def frame_speed(frame, previous, previous_written, written):
+    """给回放出来的帧补 `speed_bps`，返回本帧的 {key: bytes_done}。
+
+    间隔取**快照自己的写入时刻之差**，不是两次回放的间隔：同一条数据被回放十次，按回放间隔
+    算出来的速度会放大十倍 —— 那是在测回放频率，不是传输速率。快照没换（写入时刻没往前走）
+    就不补速度：宁可这一帧不显示速度，也不显示一个编出来的。
+    """
+    stamp = time.time()
+    active = frame.get("active") or []
+    current = {active_key(e): e.get("bytes_done")
+               for e in active if e.get("bytes_done") is not None}
+    dt = (written - previous_written) if (written is not None and previous_written is not None) else 0
+    if previous is not None and dt > 0:
+        for entry in active:
+            key = active_key(entry)
+            done = entry.get("bytes_done")
+            if done is None or key not in previous:
+                continue
+            delta = done - previous[key]
+            if delta >= 0:
+                entry["speed_bps"] = int(delta / dt)
+    return current, stamp
+
+
+def serve_frame(csv_path, limit, channel, cache_path, previous, previous_at, previous_written):
+    """取一帧：有新鲜快照就回放，没有/过期就现算。
+
+    返回 (帧, 本帧 bytes 映射, 时刻, 快照写入时刻)。回放那一支会在帧里加 `cache`
+    字段说明「这是回放、数据多旧」—— **不把一份快照伪装成现算的**。
+    """
+    if cache_path:
+        frame, age, written = load_cache(cache_path, CACHE_MAX_AGE_S)
+        if frame is not None:
+            frame = apply_view(frame, channel, limit)
+            frame["cache"] = {"path": os.path.expanduser(cache_path),
+                              "age_s": int(age), "written_epoch": int(written)}
+            current, stamp = frame_speed(frame, previous, previous_written, written)
+            return frame, current, stamp, written
+    frame, current, stamp = snapshot(csv_path, limit, previous, previous_at, channel)
+    return frame, current, stamp, None
 
 
 def snapshot(csv_path, limit, previous, previous_at, channel=None):
@@ -478,6 +753,9 @@ def snapshot(csv_path, limit, previous, previous_at, channel=None):
     """
     rows = load_rows(csv_path)
     extra, ledgers = extra_rows()
+    # 进度来源优先级：中转台账（本地快盘，不碰网络挂载）→ 扫目标目录（贵，受时间预算约束）。
+    ledger, ledger_age = load_ledger(LEDGER_PATH) if LEDGER_PATH else ({}, None)
+    deadline = (time.time() + SCAN_BUDGET_S) if SCAN_BUDGET_S > 0 else None
     counts = {}
     active = []
     recent = []
@@ -509,7 +787,7 @@ def snapshot(csv_path, limit, previous, previous_at, channel=None):
             entry["updated_epoch"] = int(epoch)
 
         if status in ACTIVE_STATES:
-            info, _ = progress_of(row)
+            info, _ = progress_of(row, ledger=ledger, ledger_age=ledger_age, deadline=deadline)
             if info:
                 entry.update(info)
                 # 台账 size 列是空的（在下中的行往往还没量过），就用 sidecar 报的全文件大小补上，
@@ -521,21 +799,32 @@ def snapshot(csv_path, limit, previous, previous_at, channel=None):
         elif status in DONE_STATES:
             recent.append(entry)
 
-    # 在下任务：真在传输的排前面；其次按「最近动过」（三路活性里最新的一路，即实际顺序），
-    # 再次按进度、物种名。三路都没动过的排最后 —— 它们是待重排队的残留。
-    active.sort(key=lambda e: (not e.get("live"), activity_age(e), -(e.get("percent") or -1),
-                               e.get("name", "")))
-
     # 通道归属：此刻哪条通道在写哪个文件，扫 /proc 得到。只有**正在传**的才可能有归属；
     # 台账里挂着的残留没有归属（要 driver 真派给某个口才算那个口的）。匹配先按
     # 「目标目录 + 文件名」，不中再退化为只比文件名（下载器可能先落 SSD 中转再搬走）。
+    # 三路都不中，最后退到台账自己记的口 —— 终验/搬运两个阶段根本没有下载进程，
+    # 前两路必然全空，没有这一路它们就成了「无归属」，按口看时整条消失。
     channels = running_channels()
     by_name = {}
     for out_path, chan in channels.items():
         by_name.setdefault(os.path.basename(out_path), chan)
+    seen = set()
     for entry in active:
-        target = os.path.join(entry.get("path") or "", entry.get("file") or "")
-        entry["channel"] = channels.get(target) or by_name.get(entry.get("file") or "")
+        target = os.path.normpath(os.path.join(entry.get("path") or "", entry.get("file") or ""))
+        entry["channel"] = (channels.get(target) or by_name.get(entry.get("file") or "")
+                            or (str(entry.get("port") or "") or None))
+        if entry.get("file"):
+            seen.add(target)
+
+    # 台账里还在跑、上面却没有任何一行认领的件，补成独立的行 —— 同目录并发两份时，
+    # 第二条只存在于台账里，不补就在帧里隐身（见 live_entries 的说明）。
+    active.extend(live_entries(ledger, ledger_age, channels, by_name, seen))
+
+    # 在下任务：真在传输的排前面；其次按「最近动过」（三路活性里最新的一路，即实际顺序），
+    # 再次按进度、目标名。三路都没动过的排最后 —— 它们是待重排队的残留。
+    # **排在补行之后**：补进来的行同样要参与排序，先排就等于把它们全摁在队尾。
+    active.sort(key=lambda e: (not e.get("live"), activity_age(e), -(e.get("percent") or -1),
+                               e.get("name", "")))
 
     # 最近完成：按 epoch 倒序。**不能比字符串** —— 一路台账写 +8、另一路写 UTC，
     # 混排时两边的钟不一样，看着像时间倒流。
@@ -547,7 +836,7 @@ def snapshot(csv_path, limit, previous, previous_at, channel=None):
     if previous is not None and previous_at is not None and stamp > previous_at:
         dt = stamp - previous_at
         for entry in active:
-            key = entry.get("name", "") + "|" + entry.get("path", "")
+            key = active_key(entry)
             done = entry.get("bytes_done")
             if done is None or key not in previous:
                 continue
@@ -555,7 +844,7 @@ def snapshot(csv_path, limit, previous, previous_at, channel=None):
             if delta >= 0:
                 entry["speed_bps"] = int(delta / dt)
 
-    current = {e.get("name", "") + "|" + e.get("path", ""): e.get("bytes_done")
+    current = {active_key(e): e.get("bytes_done")
                for e in active if e.get("bytes_done") is not None}
 
     # 通道过滤放在最后：速度计算与续帧（current）用的都是过滤前的全表。全局口径（在下总数 /
@@ -638,10 +927,15 @@ def main(argv=None):
     parser.add_argument("--text", action="store_true", help="输出人看的表格")
     parser.add_argument("--watch", type=int, default=0, metavar="SEC",
                         help="每 SEC 秒输出一行 JSON，直到管道断开")
+    parser.add_argument("--cache", default="", metavar="PATH",
+                        help="预计算快照（本地快盘上）；新鲜就用它，省掉对网络挂载的扫描")
+    parser.add_argument("--no-cache", action="store_true", help="忽略快照，强制现算")
     args = parser.parse_args(argv)
 
     # 通道口径：容忍 `win:<口>` / 大写 / 空格；空串 = 不过滤（老调用方一字不改照常工作）
     channel = (args.channel or "").strip().lower().replace("win:", "") or None
+    # 快照口径：命令行给了用命令行的，否则看配置；--no-cache 一律现算。
+    cache_path = "" if args.no_cache else (args.cache or CACHE_PATH)
 
     csv_path, checked = find_csv(args.status_csv)
     if not csv_path or not os.path.isfile(csv_path):
@@ -656,29 +950,30 @@ def main(argv=None):
         if args.text:
             print(f"ERROR: {error['error']}（找过：{', '.join(error['checked'])}）")
         else:
-            print(json.dumps(error, ensure_ascii=False), flush=True)
+            print(json.dumps(error, ensure_ascii=True), flush=True)     # ASCII 上线：见模块文档
         return 2
 
     if args.watch > 0:
-        previous, previous_at = None, None
+        previous, previous_at, previous_written = None, None, None
         while True:
             try:
-                frame, previous, previous_at = snapshot(csv_path, args.limit, previous, previous_at,
-                                                        channel)
+                frame, previous, previous_at, previous_written = serve_frame(
+                    csv_path, args.limit, channel, cache_path,
+                    previous, previous_at, previous_written)
             except Exception as error:      # 读台账失败也不能把 watch 打死：报一帧错误继续
                 frame = {"ok": False, "schema": SCHEMA, "generated": now_text(),
                          "csv": csv_path, "error": repr(error)}
-            print(json.dumps(frame, ensure_ascii=False), flush=True)
+            print(json.dumps(frame, ensure_ascii=True), flush=True)     # ASCII 上线：见模块文档
             try:
                 time.sleep(args.watch)
             except KeyboardInterrupt:
                 return 0
 
-    frame, _, _ = snapshot(csv_path, args.limit, None, None, channel)
+    frame, _, _, _ = serve_frame(csv_path, args.limit, channel, cache_path, None, None, None)
     if args.text:
         render_text(frame)
     else:
-        print(json.dumps(frame, ensure_ascii=False), flush=True)
+        print(json.dumps(frame, ensure_ascii=True), flush=True)         # ASCII 上线：见模块文档
     return 0
 
 

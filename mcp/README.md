@@ -78,8 +78,9 @@ WORKER_DIR = $DL_WORKER_DIR
 
 `submit`（提交到统一队列，带下载等级 p0–p4；一次多条用 `items`）/ `queue_status`（含**按通道**的逐线进度）/
 `ctl`（线数·暂停·插队·让路）/ `lease_status` / `worker_status` / `alerts` / `overview` /
-`inventory`（清单自管刷新；需另行配置刷新器，未配时该工具会说明）/ `download_status` /
-`download`（临时单文件，租约感知）。
+`inventory`（清单自管刷新；需另行配置刷新器，未配时该工具会说明）/
+`download_status`（**两种问法**：给 `output` 看那一个文件；不给则读中转盘上的下载台账 ——
+不传 `port` = 全局的安排与进度，传 `port` = 那个口的）/ `download`（临时单文件，租约感知）。
 
 **无状态**：状态全在共享文件与 flock 里 ⇒ 多 agent 各起一份 MCP 进程也不会互相抢口
 （口租约由内核 flock 仲裁，进程死了自动释放）。

@@ -47,6 +47,23 @@ def main():
         # hanging in connect() and the supervisor sees a "running" tunnel that is
         # not coming back.
         "-o", "ConnectTimeout=15",
+        # Retry the connection+handshake inside THIS ssh process instead of exiting and
+        # leaving it to the supervisor's seconds-long backoff ladder.
+        #
+        # Measured over the full tunnel.log (2428 sessions): the second most
+        # common failure was NOT a dead session but "connect to host ... port 22:
+        # Connection timed out" -- 516 times, 21% of all attempts, second only to the
+        # port-held rebinds.  The machine and the network were demonstrably fine at those
+        # moments (worker healthy, ping 6/6, parallel ssh sessions working), so these are
+        # short windows where a NEW TCP connection cannot complete -- the peer is
+        # re-negotiating its path (Tailscale showed a live direct path with a fresh
+        # handshake) and an established connection keeps working while a new one fails.
+        # A single attempt therefore turns a few-second window into a full reconnect
+        # cycle.  ConnectionAttempts makes the client retry by itself before giving up.
+        # Per ssh_config(5) the retries are "one per second" while ConnectTimeout bounds
+        # each attempt, so the worst case per ssh process is ~3 x 15s -- bounded, and the
+        # supervisor's ladder still covers the case where the whole path is really down.
+        "-o", "ConnectionAttempts=3",
         "-o", "ExitOnForwardFailure=yes",
         "-o", "BatchMode=yes",
         # TCP-level keepalive on top of the SSH-level one above: cheap, supported by
